@@ -1,5 +1,11 @@
-import { ChevronLeft, ChevronRight, FileText, Loader2 } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
+import {
+	ChevronLeft,
+	ChevronRight,
+	FileText,
+	Loader2,
+	X,
+} from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Document as PDFDocument, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
@@ -16,11 +22,23 @@ const MIN_WIDTH = 280;
 const MAX_WIDTH = 700;
 const DEFAULT_WIDTH = 400;
 
+function normalizeForMatch(text: string): string {
+	return text
+		.toLowerCase()
+		.normalize("NFKD")
+		.replace(/[^\w\s]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 interface DocumentViewerProps {
 	document: Document | null;
 	documents: Document[];
 	activeDocId: string | null;
 	onSelectDocument: (id: string) => void;
+	targetPage: number | null;
+	highlightText: string | null;
+	onClearHighlight?: () => void;
 }
 
 export function DocumentViewer({
@@ -28,6 +46,9 @@ export function DocumentViewer({
 	documents,
 	activeDocId,
 	onSelectDocument,
+	targetPage,
+	highlightText,
+	onClearHighlight,
 }: DocumentViewerProps) {
 	const [numPages, setNumPages] = useState<number>(0);
 	const [currentPage, setCurrentPage] = useState(1);
@@ -36,6 +57,71 @@ export function DocumentViewer({
 	const [width, setWidth] = useState(DEFAULT_WIDTH);
 	const [dragging, setDragging] = useState(false);
 	const containerRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		if (targetPage !== null && targetPage >= 1 && targetPage <= numPages) {
+			setCurrentPage(targetPage);
+		}
+	}, [targetPage, numPages]);
+
+	const applyHighlightToTextLayer = useCallback(() => {
+		if (!containerRef.current) return;
+
+		const textLayer = containerRef.current.querySelector(".textLayer");
+		if (!textLayer) return;
+
+		textLayer.querySelectorAll(".citation-highlight").forEach((el) => {
+			(el as HTMLElement).style.backgroundColor = "";
+			(el as HTMLElement).style.borderRadius = "";
+			el.classList.remove("citation-highlight");
+		});
+
+		if (!highlightText) return;
+
+		const spans = Array.from(
+			textLayer.querySelectorAll('span[role="presentation"]'),
+		) as HTMLElement[];
+		if (spans.length === 0) return;
+
+		const texts = spans.map((s) => s.textContent || "");
+		const norms = texts.map(normalizeForMatch);
+
+		const stripWs = (s: string) => s.replace(/\s+/g, "");
+
+		const spanRanges: { start: number; end: number }[] = [];
+		let pos = 0;
+		for (const norm of norms) {
+			const stripped = stripWs(norm);
+			spanRanges.push({ start: pos, end: pos + stripped.length });
+			pos += stripped.length;
+		}
+
+		const fullStripped = norms.map(stripWs).join("");
+		const quoteStripped = stripWs(normalizeForMatch(highlightText));
+
+		if (quoteStripped.length < 5) return;
+
+		const matchIdx = fullStripped.indexOf(quoteStripped);
+		if (matchIdx === -1) return;
+
+		const matchEnd = matchIdx + quoteStripped.length;
+		for (let i = 0; i < spanRanges.length; i++) {
+			if (spanRanges[i].end > matchIdx && spanRanges[i].start < matchEnd) {
+				spans[i].style.backgroundColor = "rgba(254, 240, 138, 0.6)";
+				spans[i].style.borderRadius = "2px";
+				spans[i].classList.add("citation-highlight");
+			}
+		}
+
+		const first = textLayer.querySelector(".citation-highlight");
+		if (first) {
+			first.scrollIntoView({ block: "center", behavior: "smooth" });
+		}
+	}, [highlightText]);
+
+	useEffect(() => {
+		applyHighlightToTextLayer();
+	}, [applyHighlightToTextLayer]);
 
 	const handleMouseDown = useCallback(
 		(e: React.MouseEvent) => {
@@ -147,6 +233,23 @@ export function DocumentViewer({
 				</div>
 			</div>
 
+			{/* Highlight indicator */}
+			{highlightText && (
+				<div className="flex items-center gap-2 border-b border-yellow-200 bg-yellow-50 px-4 py-1.5">
+					<span className="flex-1 truncate text-[11px] text-yellow-800">
+						Highlighting: "{highlightText.slice(0, 60)}
+						{highlightText.length > 60 ? "…" : ""}"
+					</span>
+					<button
+						type="button"
+						onClick={onClearHighlight}
+						className="flex-shrink-0 rounded p-0.5 text-yellow-600 hover:bg-yellow-100"
+					>
+						<X className="h-3.5 w-3.5" />
+					</button>
+				</div>
+			)}
+
 			{/* PDF content */}
 			<div className="flex-1 overflow-y-auto p-4">
 				{pdfError && (
@@ -174,17 +277,19 @@ export function DocumentViewer({
 							</div>
 						}
 					>
-						{!pdfLoading && !pdfError && (
-							<Page
-								pageNumber={currentPage}
-								width={pdfPageWidth}
-								loading={
-									<div className="flex items-center justify-center py-12">
-										<Loader2 className="h-5 w-5 animate-spin text-neutral-300" />
-									</div>
-								}
-							/>
-						)}
+					{!pdfLoading && !pdfError && (
+						<Page
+							key={`${document?.id}-${currentPage}`}
+							pageNumber={currentPage}
+							width={pdfPageWidth}
+							onRenderTextLayerSuccess={applyHighlightToTextLayer}
+							loading={
+								<div className="flex items-center justify-center py-12">
+									<Loader2 className="h-5 w-5 animate-spin text-neutral-300" />
+								</div>
+							}
+						/>
+					)}
 					</PDFDocument>
 				)}
 			</div>

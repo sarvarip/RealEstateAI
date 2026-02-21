@@ -15,7 +15,11 @@ from takehome.db.models import Message
 from takehome.db.session import get_session
 from takehome.services.conversation import get_conversation, update_conversation
 from takehome.services.document import get_documents_for_conversation
-from takehome.services.llm import build_document_context, chat_with_documents, count_sources_cited, generate_title
+from takehome.services.llm import (
+    answer_with_citations,
+    build_document_context,
+    generate_title,
+)
 
 logger = structlog.get_logger()
 
@@ -27,12 +31,28 @@ router = APIRouter(tags=["messages"])
 # --------------------------------------------------------------------------- #
 
 
+class CitationOut(BaseModel):
+    index: int
+    document_id: str | None
+    filename: str
+    page: int
+    quote: str
+    verified: bool
+
+
+class SegmentOut(BaseModel):
+    text: str
+    citations: list[CitationOut]
+
+
 class MessageOut(BaseModel):
     id: str
     conversation_id: str
     role: str
     content: str
     sources_cited: int
+    citations: list[CitationOut]
+    segments: list[SegmentOut] | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -40,6 +60,47 @@ class MessageOut(BaseModel):
 
 class MessageCreate(BaseModel):
     content: str
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _message_to_out(m: Message) -> MessageOut:
+    """Convert a DB Message to a MessageOut, handling both legacy and v2 formats."""
+    citations: list[CitationOut] = []
+    segments: list[SegmentOut] | None = None
+
+    if m.citations_json:
+        try:
+            raw = json.loads(m.citations_json)
+        except (json.JSONDecodeError, TypeError):
+            raw = None
+
+        if isinstance(raw, dict) and raw.get("version") == 2:
+            segments = []
+            for seg_data in raw.get("segments", []):
+                seg_cites = [CitationOut(**c) for c in seg_data.get("citations", [])]
+                citations.extend(seg_cites)
+                segments.append(SegmentOut(text=seg_data["text"], citations=seg_cites))
+        elif isinstance(raw, list):
+            for c in raw:
+                citations.append(CitationOut(**{
+                    k: v for k, v in c.items()
+                    if k in CitationOut.model_fields
+                }))
+
+    return MessageOut(
+        id=m.id,
+        conversation_id=m.conversation_id,
+        role=m.role,
+        content=m.content,
+        sources_cited=m.sources_cited,
+        citations=citations,
+        segments=segments,
+        created_at=m.created_at,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -56,7 +117,6 @@ async def list_messages(
     session: AsyncSession = Depends(get_session),
 ) -> list[MessageOut]:
     """List all messages in a conversation, ordered by creation time."""
-    # Verify the conversation exists
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -69,17 +129,7 @@ async def list_messages(
     result = await session.execute(stmt)
     messages = list(result.scalars().all())
 
-    return [
-        MessageOut(
-            id=m.id,
-            conversation_id=m.conversation_id,
-            role=m.role,
-            content=m.content,
-            sources_cited=m.sources_cited,
-            created_at=m.created_at,
-        )
-        for m in messages
-    ]
+    return [_message_to_out(m) for m in messages]
 
 
 @router.post("/api/conversations/{conversation_id}/messages")
@@ -89,13 +139,11 @@ async def send_message(
     rag_threshold: int | None = Query(None, description="Override RAG token threshold (for testing)"),
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
-    """Send a user message and stream back the AI response via SSE."""
-    # Verify the conversation exists
+    """Send a user message and return the AI response via SSE."""
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Save the user message
     user_message = Message(
         conversation_id=conversation_id,
         role="user",
@@ -107,7 +155,6 @@ async def send_message(
 
     logger.info("User message saved", conversation_id=conversation_id, message_id=user_message.id)
 
-    # Load all documents for the conversation
     documents = await get_documents_for_conversation(session, conversation_id)
 
     doc_context = await build_document_context(
@@ -118,7 +165,6 @@ async def send_message(
         rag_threshold_override=rag_threshold,
     )
 
-    # Load conversation history (exclude the message we just saved, it will be the user_message param)
     stmt = (
         select(Message)
         .where(Message.conversation_id == conversation_id)
@@ -132,53 +178,56 @@ async def send_message(
         {"role": m.role, "content": m.content} for m in history_messages
     ]
 
-    # Determine if this is the first user message (for title generation)
     user_msg_count = sum(1 for m in history_messages if m.role == "user")
     is_first_message = user_msg_count == 0
 
     async def event_stream() -> AsyncIterator[str]:
-        """Generate SSE events with the streamed LLM response."""
-        full_response = ""
+        """Generate SSE events with the structured LLM response."""
+
+        # Tell the frontend we're working on it
+        yield _sse({"type": "status", "status": "thinking"})
 
         try:
-            async for chunk in chat_with_documents(
+            structured = await answer_with_citations(
                 user_message=body.content,
                 context=doc_context,
                 conversation_history=conversation_history,
-            ):
-                full_response += chunk
-                event_data = json.dumps({"type": "content", "content": chunk})
-                yield f"data: {event_data}\n\n"
-
-        except Exception:
-            logger.exception(
-                "Error during LLM streaming",
-                conversation_id=conversation_id,
+                documents=documents,
             )
+        except Exception:
+            logger.exception("Error during LLM call", conversation_id=conversation_id)
             error_msg = "I'm sorry, an error occurred while generating a response. Please try again."
-            full_response = error_msg
-            event_data = json.dumps({"type": "content", "content": error_msg})
-            yield f"data: {event_data}\n\n"
+            yield _sse({"type": "content", "content": error_msg})
+            structured = None
 
-        # Count sources cited in the full response
-        sources = count_sources_cited(full_response)
+        if structured is None:
+            yield _sse({"type": "done", "sources_cited": 0})
+            return
 
-        # Save the assistant message to the database.
-        # We need a fresh session since the outer one may have been closed.
+        sources = len(structured.citations)
+
+        citations_json = json.dumps({
+            "version": 2,
+            "segments": structured.segments,
+        })
+
+        # Emit segments for immediate rendering
+        yield _sse({"type": "segments", "segments": structured.segments})
+
         from takehome.db.session import async_session as session_factory
 
         async with session_factory() as save_session:
             assistant_message = Message(
                 conversation_id=conversation_id,
                 role="assistant",
-                content=full_response,
+                content=structured.content,
                 sources_cited=sources,
+                citations_json=citations_json,
             )
             save_session.add(assistant_message)
             await save_session.commit()
             await save_session.refresh(assistant_message)
 
-            # Auto-generate title from first user message
             if is_first_message:
                 try:
                     title = await generate_title(body.content)
@@ -189,36 +238,39 @@ async def send_message(
                         title=title,
                     )
                 except Exception:
-                    logger.exception(
-                        "Failed to generate title",
-                        conversation_id=conversation_id,
-                    )
+                    logger.exception("Failed to generate title", conversation_id=conversation_id)
 
-            # Send the final message event with the complete assistant message
-            message_data = json.dumps(
+            flat_citations = [
                 {
-                    "type": "message",
-                    "message": {
-                        "id": assistant_message.id,
-                        "conversation_id": assistant_message.conversation_id,
-                        "role": assistant_message.role,
-                        "content": assistant_message.content,
-                        "sources_cited": assistant_message.sources_cited,
-                        "created_at": assistant_message.created_at.isoformat(),
-                    },
+                    "index": c.index,
+                    "document_id": c.document_id,
+                    "filename": c.filename,
+                    "page": c.page,
+                    "quote": c.quote,
+                    "verified": c.verified,
                 }
-            )
-            yield f"data: {message_data}\n\n"
+                for c in structured.citations
+            ]
 
-            # Send the done signal
-            done_data = json.dumps(
-                {
-                    "type": "done",
-                    "sources_cited": sources,
-                    "message_id": assistant_message.id,
-                }
-            )
-            yield f"data: {done_data}\n\n"
+            yield _sse({
+                "type": "message",
+                "message": {
+                    "id": assistant_message.id,
+                    "conversation_id": assistant_message.conversation_id,
+                    "role": assistant_message.role,
+                    "content": assistant_message.content,
+                    "sources_cited": assistant_message.sources_cited,
+                    "citations": flat_citations,
+                    "segments": structured.segments,
+                    "created_at": assistant_message.created_at.isoformat(),
+                },
+            })
+
+            yield _sse({
+                "type": "done",
+                "sources_cited": sources,
+                "message_id": assistant_message.id,
+            })
 
     return StreamingResponse(
         event_stream(),
@@ -229,3 +281,8 @@ async def send_message(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _sse(data: dict) -> str:
+    """Format a dict as an SSE data line."""
+    return f"data: {json.dumps(data)}\n\n"

@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../lib/api";
-import type { Message } from "../types";
+import type { AnswerSegment, Citation, Message } from "../types";
 
 export function useMessages(conversationId: string | null) {
 	const [messages, setMessages] = useState<Message[]>([]);
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
-	const [streaming, setStreaming] = useState(false);
-	const [streamingContent, setStreamingContent] = useState("");
+	const [thinking, setThinking] = useState(false);
 	const abortRef = useRef<AbortController | null>(null);
 
 	const refresh = useCallback(async () => {
@@ -38,7 +37,7 @@ export function useMessages(conversationId: string | null) {
 
 	const send = useCallback(
 		async (content: string) => {
-			if (!conversationId || streaming) return;
+			if (!conversationId || thinking) return;
 
 			const userMessage: Message = {
 				id: `temp-${Date.now()}`,
@@ -46,13 +45,16 @@ export function useMessages(conversationId: string | null) {
 				role: "user",
 				content,
 				sources_cited: 0,
+				citations: [],
 				created_at: new Date().toISOString(),
 			};
 
 			setMessages((prev) => [...prev, userMessage]);
-			setStreaming(true);
-			setStreamingContent("");
+			setThinking(true);
 			setError(null);
+
+			let pendingSegments: AnswerSegment[] | undefined;
+			let pendingCitations: Citation[] = [];
 
 			try {
 				const response = await api.sendMessage(conversationId, content);
@@ -63,7 +65,6 @@ export function useMessages(conversationId: string | null) {
 
 				const reader = response.body.getReader();
 				const decoder = new TextDecoder();
-				let accumulated = "";
 				let buffer = "";
 
 				while (true) {
@@ -72,7 +73,6 @@ export function useMessages(conversationId: string | null) {
 
 					buffer += decoder.decode(value, { stream: true });
 					const lines = buffer.split("\n");
-					// Keep the last potentially incomplete line in the buffer
 					buffer = lines.pop() ?? "";
 
 					for (const line of lines) {
@@ -85,66 +85,66 @@ export function useMessages(conversationId: string | null) {
 						try {
 							const parsed = JSON.parse(data) as {
 								type?: string;
-								content?: string;
-								delta?: string;
+								status?: string;
+								segments?: AnswerSegment[];
+								citations?: Citation[];
 								message?: Message;
+								content?: string;
 							};
 
-							if (parsed.type === "delta" && parsed.delta) {
-								accumulated += parsed.delta;
-								setStreamingContent(accumulated);
-							} else if (parsed.type === "content" && parsed.content) {
-								accumulated += parsed.content;
-								setStreamingContent(accumulated);
+							if (parsed.type === "status") {
+								// "thinking" status — keep showing loader
+							} else if (parsed.type === "segments") {
+								pendingSegments = parsed.segments;
+								pendingCitations =
+									parsed.segments?.flatMap(
+										(s: AnswerSegment) => s.citations,
+									) ?? [];
 							} else if (parsed.type === "message" && parsed.message) {
-								// Final message from server
-								setMessages((prev) => [...prev, parsed.message as Message]);
-								accumulated = "";
-							} else if (parsed.content && !parsed.type) {
-								// Fallback: plain content field
-								accumulated += parsed.content;
-								setStreamingContent(accumulated);
+								const msg: Message = {
+									...parsed.message,
+									citations:
+										parsed.message.citations ?? pendingCitations,
+									segments:
+										parsed.message.segments ?? pendingSegments,
+								};
+								setMessages((prev) => [...prev, msg]);
+							} else if (parsed.type === "content" && parsed.content) {
+								// Error fallback — plain content with no structured data
+								const fallbackMsg: Message = {
+									id: `err-${Date.now()}`,
+									conversation_id: conversationId,
+									role: "assistant",
+									content: parsed.content,
+									sources_cited: 0,
+									citations: [],
+									created_at: new Date().toISOString(),
+								};
+								setMessages((prev) => [...prev, fallbackMsg]);
 							}
 						} catch {
-							// Skip invalid JSON lines
+							// Skip invalid JSON
 						}
 					}
 				}
 
-				// If we accumulated content but never got a final message,
-				// create a synthetic assistant message
-				if (accumulated) {
-					const assistantMessage: Message = {
-						id: `stream-${Date.now()}`,
-						conversation_id: conversationId,
-						role: "assistant",
-						content: accumulated,
-						sources_cited: 0,
-						created_at: new Date().toISOString(),
-					};
-					setMessages((prev) => [...prev, assistantMessage]);
-				}
-
-				// Refresh to get server-canonical messages
 				const freshMessages = await api.fetchMessages(conversationId);
 				setMessages(freshMessages);
 			} catch (err) {
 				if (err instanceof DOMException && err.name === "AbortError") return;
 				setError(err instanceof Error ? err.message : "Failed to send message");
 			} finally {
-				setStreaming(false);
-				setStreamingContent("");
+				setThinking(false);
 			}
 		},
-		[conversationId, streaming],
+		[conversationId, thinking],
 	);
 
 	return {
 		messages,
 		loading,
 		error,
-		streaming,
-		streamingContent,
+		thinking,
 		send,
 		refresh,
 	};

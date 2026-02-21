@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ChatSidebar } from "./components/ChatSidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { DocumentViewer } from "./components/DocumentViewer";
@@ -6,6 +6,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { useConversations } from "./hooks/use-conversations";
 import { useDocument } from "./hooks/use-document";
 import { useMessages } from "./hooks/use-messages";
+import type { Citation } from "./types";
 
 export default function App() {
 	const {
@@ -22,8 +23,7 @@ export default function App() {
 		messages,
 		loading: messagesLoading,
 		error: messagesError,
-		streaming,
-		streamingContent,
+		thinking,
 		send,
 	} = useMessages(selectedId);
 
@@ -35,6 +35,14 @@ export default function App() {
 		upload,
 		refresh: refreshDocument,
 	} = useDocument(selectedId);
+
+	const [targetPage, setTargetPage] = useState<number | null>(null);
+	const [highlightText, setHighlightText] = useState<string | null>(null);
+
+	useEffect(() => {
+		setTargetPage(null);
+		setHighlightText(null);
+	}, [selectedId]);
 
 	const handleSend = useCallback(
 		async (content: string) => {
@@ -59,6 +67,27 @@ export default function App() {
 		await create();
 	}, [create]);
 
+	const handleCitationClick = useCallback(
+		(citation: Citation) => {
+			if (citation.document_id) {
+				const matchedDoc = documents.find(
+					(d) => d.id === citation.document_id,
+				);
+				if (matchedDoc) {
+					setActiveDocId(matchedDoc.id);
+				}
+			}
+			setTargetPage(citation.page);
+			setHighlightText(citation.quote || null);
+		},
+		[documents, setActiveDocId],
+	);
+
+	const handleClearHighlight = useCallback(() => {
+		setHighlightText(null);
+		setTargetPage(null);
+	}, []);
+
 	return (
 		<TooltipProvider delayDuration={200}>
 			<div className="flex h-screen bg-neutral-50">
@@ -71,23 +100,26 @@ export default function App() {
 					onDelete={remove}
 				/>
 
-				<ChatWindow
-					messages={messages}
-					loading={messagesLoading}
-					error={messagesError}
-					streaming={streaming}
-					streamingContent={streamingContent}
-					hasDocument={documents.length > 0}
-					conversationId={selectedId}
-					onSend={handleSend}
-					onUpload={handleUpload}
-				/>
+			<ChatWindow
+				messages={messages}
+				loading={messagesLoading}
+				error={messagesError}
+				thinking={thinking}
+				hasDocument={documents.length > 0}
+				conversationId={selectedId}
+				onSend={handleSend}
+				onUpload={handleUpload}
+				onCitationClick={handleCitationClick}
+			/>
 
 				<DocumentViewer
 					document={document}
 					documents={documents}
 					activeDocId={activeDocId}
 					onSelectDocument={setActiveDocId}
+					targetPage={targetPage}
+					highlightText={highlightText}
+					onClearHighlight={handleClearHighlight}
 				/>
 			</div>
 		</TooltipProvider>

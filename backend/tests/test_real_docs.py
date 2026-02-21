@@ -30,9 +30,9 @@ REAL_DOC_FILES = [
 ]
 
 
-def _parse_sse_response(response: httpx.Response) -> str:
-    """Extract the final assistant message content from an SSE stream."""
-    content = ""
+def _parse_sse_events(response: httpx.Response) -> list[dict]:
+    """Parse all SSE events from a response into a list of dicts."""
+    events: list[dict] = []
     for line in response.text.splitlines():
         line = line.strip()
         if not line.startswith("data: "):
@@ -41,14 +41,20 @@ def _parse_sse_response(response: httpx.Response) -> str:
         if data == "[DONE]":
             break
         try:
-            parsed = json.loads(data)
-            if parsed.get("type") == "message":
-                return parsed["message"]["content"]
-            if parsed.get("type") == "content":
-                content += parsed.get("content", "")
+            events.append(json.loads(data))
         except json.JSONDecodeError:
             continue
-    return content
+    return events
+
+
+def _parse_sse_response(response: httpx.Response) -> str:
+    """Extract the final assistant message content from an SSE stream."""
+    for event in _parse_sse_events(response):
+        if event.get("type") == "message":
+            return event["message"]["content"]
+        if event.get("type") == "content":
+            return event.get("content", "")
+    return ""
 
 
 def _create_conversation_with_docs() -> str:
@@ -95,7 +101,7 @@ def _ask_question(conv_id: str, question: str, rag_threshold: int | None = None)
     if rag_threshold is not None:
         params["rag_threshold"] = rag_threshold
 
-    with httpx.Client(base_url=BASE_URL, timeout=120) as client:
+    with httpx.Client(base_url=BASE_URL, timeout=300) as client:
         resp = client.post(
             f"/api/conversations/{conv_id}/messages",
             json={"content": question},
@@ -103,6 +109,26 @@ def _ask_question(conv_id: str, question: str, rag_threshold: int | None = None)
         )
         resp.raise_for_status()
         return _parse_sse_response(resp)
+
+
+def _ask_question_full(conv_id: str, question: str, rag_threshold: int | None = None) -> dict:
+    """Send a question and return the full message event (with segments, citations, etc.)."""
+    params = {}
+    if rag_threshold is not None:
+        params["rag_threshold"] = rag_threshold
+
+    with httpx.Client(base_url=BASE_URL, timeout=300) as client:
+        resp = client.post(
+            f"/api/conversations/{conv_id}/messages",
+            json={"content": question},
+            params=params,
+        )
+        resp.raise_for_status()
+        events = _parse_sse_events(resp)
+        for event in events:
+            if event.get("type") == "message":
+                return event["message"]
+        raise AssertionError(f"No 'message' event found in SSE response. Events: {[e.get('type') for e in events]}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -159,6 +185,138 @@ class TestFullContext:
         assert has_rights, f"Expected discussion of rights in answer:\n{answer}"
         assert has_variation_ref, (
             f"Expected reference to Deed of Variation or additional/new rights in answer:\n{answer}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Structured citations — rent + parties from Rent Review Memo only
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+RENT_MEMO_FILE = "Rent review memorandum - 8th Fl, Building 5, New Street Sq.pdf"
+
+
+def _create_rent_memo_conversation() -> str:
+    """Create a conversation with only the Rent Review Memorandum."""
+    with httpx.Client(base_url=BASE_URL, timeout=600) as client:
+        resp = client.post("/api/conversations", json={})
+        resp.raise_for_status()
+        conv_id = resp.json()["id"]
+
+        filepath = REAL_DOCS_DIR / RENT_MEMO_FILE
+        if not filepath.exists():
+            pytest.skip(f"Real doc not found: {filepath}")
+        with open(filepath, "rb") as f:
+            resp = client.post(
+                f"/api/conversations/{conv_id}/documents",
+                files={"file": (RENT_MEMO_FILE, f, "application/pdf")},
+            )
+            resp.raise_for_status()
+
+    return conv_id
+
+
+@pytest.fixture(scope="module")
+def rent_memo_conversation() -> str:
+    """Conversation with only the Rent Review Memorandum uploaded."""
+    return _create_rent_memo_conversation()
+
+
+_STRUCTURED_QUESTION = "What is the current rent and who are the current parties (landlord and tenant)?"
+
+_cached_structured_response: dict | None = None
+
+
+def _get_structured_response(conv_id: str) -> dict:
+    """Ask the structured-citations question once and cache the result for all tests."""
+    global _cached_structured_response
+    if _cached_structured_response is None:
+        _cached_structured_response = _ask_question_full(conv_id, _STRUCTURED_QUESTION)
+    return _cached_structured_response
+
+
+class TestStructuredCitations:
+    """Validate that the structured-output pipeline returns correct segments and citations."""
+
+    def test_rent_and_parties_answer(self, rent_memo_conversation: str) -> None:
+        """The answer text must mention rent, landlord, and tenant."""
+        msg = _get_structured_response(rent_memo_conversation)
+
+        answer_lower = msg["content"].lower()
+
+        assert any(
+            t in answer_lower for t in ["1,750,000", "1.75 million", "1.75m"]
+        ), f"Expected rent amount in answer:\n{msg['content']}"
+
+        assert "city of london" in answer_lower or "real property" in answer_lower, (
+            f"Expected landlord name in answer:\n{msg['content']}"
+        )
+
+        assert "stewarts" in answer_lower, (
+            f"Expected tenant name (Stewarts Law) in answer:\n{msg['content']}"
+        )
+
+    def test_segments_present(self, rent_memo_conversation: str) -> None:
+        """The response must include structured segments (not just flat content)."""
+        msg = _get_structured_response(rent_memo_conversation)
+
+        segments = msg.get("segments")
+        assert segments is not None, "Expected 'segments' in message response"
+        assert len(segments) >= 2, (
+            f"Expected at least 2 segments (rent + parties), got {len(segments)}"
+        )
+
+    def test_each_segment_has_citations(self, rent_memo_conversation: str) -> None:
+        """Every segment containing a specific factual claim should have at least one citation."""
+        msg = _get_structured_response(rent_memo_conversation)
+
+        segments = msg.get("segments", [])
+        factual_keywords = ["1,750,000", "1.75", "stewarts", "city of london", "real property"]
+        factual_without_cite = []
+        for seg in segments:
+            text_lower = seg["text"].lower()
+            has_factual_claim = any(kw in text_lower for kw in factual_keywords)
+            if has_factual_claim and len(seg.get("citations", [])) == 0:
+                factual_without_cite.append(seg["text"])
+
+        assert not factual_without_cite, (
+            f"Factual segments missing citations:\n" +
+            "\n".join(f"  - {t}" for t in factual_without_cite)
+        )
+
+    def test_citations_reference_rent_memo(self, rent_memo_conversation: str) -> None:
+        """All citations should reference the Rent Review Memorandum."""
+        msg = _get_structured_response(rent_memo_conversation)
+
+        segments = msg.get("segments", [])
+        for seg in segments:
+            for cite in seg.get("citations", []):
+                assert "rent review" in cite["filename"].lower(), (
+                    f"Citation references wrong file: {cite['filename']}"
+                )
+
+    def test_citations_have_quotes(self, rent_memo_conversation: str) -> None:
+        """Every citation must include a non-empty quote."""
+        msg = _get_structured_response(rent_memo_conversation)
+
+        segments = msg.get("segments", [])
+        for seg in segments:
+            for cite in seg.get("citations", []):
+                assert cite.get("quote") and len(cite["quote"].strip()) > 0, (
+                    f"Citation in segment '{seg['text'][:50]}...' has empty quote"
+                )
+
+    def test_citations_are_verified(self, rent_memo_conversation: str) -> None:
+        """Citations should be verified against the source document."""
+        msg = _get_structured_response(rent_memo_conversation)
+
+        segments = msg.get("segments", [])
+        all_cites = [c for seg in segments for c in seg.get("citations", [])]
+        verified = [c for c in all_cites if c.get("verified")]
+
+        assert len(verified) > 0, "Expected at least one verified citation"
+        assert len(verified) == len(all_cites), (
+            f"Only {len(verified)}/{len(all_cites)} citations verified"
         )
 
 

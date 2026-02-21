@@ -1,45 +1,43 @@
 import { Loader2 } from "lucide-react";
 import { useEffect, useRef } from "react";
-import type { Message } from "../types";
+import type { Citation, Message } from "../types";
 import { ChatInput } from "./ChatInput";
 import { EmptyState } from "./EmptyState";
-import { MessageBubble, StreamingBubble } from "./MessageBubble";
+import { MessageBubble, ThinkingBubble } from "./MessageBubble";
 
 interface ChatWindowProps {
 	messages: Message[];
 	loading: boolean;
 	error: string | null;
-	streaming: boolean;
-	streamingContent: string;
+	thinking: boolean;
 	hasDocument: boolean;
 	conversationId: string | null;
 	onSend: (content: string) => void;
 	onUpload: (file: File) => void;
+	onCitationClick?: (citation: Citation) => void;
 }
 
 export function ChatWindow({
 	messages,
 	loading,
 	error,
-	streaming,
-	streamingContent,
+	thinking,
 	hasDocument,
 	conversationId,
 	onSend,
 	onUpload,
+	onCitationClick,
 }: ChatWindowProps) {
 	const scrollRef = useRef<HTMLDivElement>(null);
 
-	// Auto-scroll to bottom when new messages arrive or during streaming
 	const messagesLength = messages.length;
-	// biome-ignore lint/correctness/useExhaustiveDependencies: messages and streamingContent are intentional triggers for auto-scroll
+	// biome-ignore lint/correctness/useExhaustiveDependencies: messages and thinking are intentional triggers for auto-scroll
 	useEffect(() => {
 		if (scrollRef.current) {
 			scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
 		}
-	}, [messagesLength, streamingContent]);
+	}, [messagesLength, thinking]);
 
-	// No conversation selected
 	if (!conversationId) {
 		return (
 			<div className="flex flex-1 items-center justify-center bg-neutral-50">
@@ -52,7 +50,6 @@ export function ChatWindow({
 		);
 	}
 
-	// Loading messages
 	if (loading) {
 		return (
 			<div className="flex flex-1 items-center justify-center bg-white">
@@ -61,8 +58,7 @@ export function ChatWindow({
 		);
 	}
 
-	// Empty conversation - show upload prompt
-	if (messages.length === 0 && !streaming) {
+	if (messages.length === 0 && !thinking) {
 		return (
 			<div className="flex flex-1 flex-col bg-white">
 				<div className="flex flex-1 items-center justify-center">
@@ -79,7 +75,7 @@ export function ChatWindow({
 				<ChatInput
 					onSend={onSend}
 					onUpload={onUpload}
-					disabled={streaming}
+					disabled={thinking}
 					hasDocument={hasDocument}
 				/>
 			</div>
@@ -97,16 +93,31 @@ export function ChatWindow({
 			<div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-4">
 				<div className="mx-auto max-w-2xl space-y-1">
 					{messages.map((message) => (
-						<MessageBubble key={message.id} message={message} />
+						<MessageBubble
+							key={message.id}
+							message={message}
+							onCitationClick={onCitationClick}
+							onRetry={
+								message.role === "assistant" &&
+								message.citations?.some((c) => !c.verified)
+									? () => {
+											const prev = messages
+												.filter((m) => m.role === "user")
+												.pop();
+											if (prev) onSend(prev.content);
+										}
+									: undefined
+							}
+						/>
 					))}
-					{streaming && <StreamingBubble content={streamingContent} />}
+					{thinking && <ThinkingBubble />}
 				</div>
 			</div>
 
 			<ChatInput
 				onSend={onSend}
 				onUpload={onUpload}
-				disabled={streaming}
+				disabled={thinking}
 				hasDocument={hasDocument}
 			/>
 		</div>
