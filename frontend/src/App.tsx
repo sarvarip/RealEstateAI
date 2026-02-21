@@ -29,6 +29,9 @@ export default function App() {
 
 	const {
 		document,
+		documents,
+		activeDocId,
+		setActiveDocId,
 		upload,
 		refresh: refreshDocument,
 	} = useDocument(selectedId);
@@ -74,13 +77,18 @@ export default function App() {
 					error={messagesError}
 					streaming={streaming}
 					streamingContent={streamingContent}
-					hasDocument={!!document}
+					hasDocument={documents.length > 0}
 					conversationId={selectedId}
 					onSend={handleSend}
 					onUpload={handleUpload}
 				/>
 
-				<DocumentViewer document={document} />
+				<DocumentViewer
+					document={document}
+					documents={documents}
+					activeDocId={activeDocId}
+					onSelectDocument={setActiveDocId}
+				/>
 			</div>
 		</TooltipProvider>
 	);

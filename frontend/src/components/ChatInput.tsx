@@ -71,16 +71,13 @@ export function ChatInput({
 								variant="ghost"
 								size="icon"
 								className="h-8 w-8 flex-shrink-0"
-								disabled={hasDocument}
 								onClick={() => fileInputRef.current?.click()}
 							>
 								<Paperclip className="h-4 w-4 text-neutral-500" />
 							</Button>
 						</div>
 					</TooltipTrigger>
-					{hasDocument && (
-						<TooltipContent>Document already uploaded</TooltipContent>
-					)}
+					<TooltipContent>Upload PDF document</TooltipContent>
 				</Tooltip>
 
 				<input

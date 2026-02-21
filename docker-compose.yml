@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: orbital
       POSTGRES_PASSWORD: orbital
@@ -23,13 +23,20 @@ services:
       - "${API_PORT:-8000}:8000"
     volumes:
       - ./backend/src:/app/backend/src
+      - ./backend/tests:/app/backend/tests
       - ./alembic:/app/alembic
       - ./uploads:/app/uploads
+      - ./real-docs:/app/real-docs
+      - ./synthetic-docs:/app/synthetic-docs
       - ./pyproject.toml:/app/pyproject.toml
       - ./alembic.ini:/app/alembic.ini
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://orbital:orbital@db:5432/orbital_takehome
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT:-}
+      AZURE_DOCUMENT_INTELLIGENCE_API_KEY: ${AZURE_DOCUMENT_INTELLIGENCE_API_KEY:-}
     depends_on:
       db:
         condition: service_healthy

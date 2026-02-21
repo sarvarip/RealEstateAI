@@ -3,23 +3,29 @@ import * as api from "../lib/api";
 import type { Document } from "../types";
 
 export function useDocument(conversationId: string | null) {
-	const [document, setDocument] = useState<Document | null>(null);
+	const [documents, setDocuments] = useState<Document[]>([]);
+	const [activeDocId, setActiveDocId] = useState<string | null>(null);
 	const [uploading, setUploading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 
 	const refresh = useCallback(async () => {
 		if (!conversationId) {
-			setDocument(null);
+			setDocuments([]);
+			setActiveDocId(null);
 			return;
 		}
 		try {
 			setError(null);
 			const detail = await api.fetchConversation(conversationId);
-			setDocument(detail.document ?? null);
+			const docs = detail.documents ?? [];
+			setDocuments(docs);
+			if (docs.length > 0 && !docs.find((d) => d.id === activeDocId)) {
+				setActiveDocId(docs[0].id);
+			}
 		} catch (err) {
-			setError(err instanceof Error ? err.message : "Failed to load document");
+			setError(err instanceof Error ? err.message : "Failed to load documents");
 		}
-	}, [conversationId]);
+	}, [conversationId, activeDocId]);
 
 	useEffect(() => {
 		refresh();
@@ -32,7 +38,8 @@ export function useDocument(conversationId: string | null) {
 				setUploading(true);
 				setError(null);
 				const doc = await api.uploadDocument(conversationId, file);
-				setDocument(doc);
+				setDocuments((prev) => [...prev, doc]);
+				setActiveDocId(doc.id);
 				return doc;
 			} catch (err) {
 				setError(
@@ -46,8 +53,13 @@ export function useDocument(conversationId: string | null) {
 		[conversationId],
 	);
 
+	const activeDocument = documents.find((d) => d.id === activeDocId) ?? null;
+
 	return {
-		document,
+		document: activeDocument,
+		documents,
+		activeDocId,
+		setActiveDocId,
 		uploading,
 		error,
 		upload,

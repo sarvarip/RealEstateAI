@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,8 +14,8 @@ from starlette.responses import StreamingResponse
 from takehome.db.models import Message
 from takehome.db.session import get_session
 from takehome.services.conversation import get_conversation, update_conversation
-from takehome.services.document import get_document_for_conversation
-from takehome.services.llm import chat_with_document, count_sources_cited, generate_title
+from takehome.services.document import get_documents_for_conversation
+from takehome.services.llm import build_document_context, chat_with_documents, count_sources_cited, generate_title
 
 logger = structlog.get_logger()
 
@@ -86,6 +86,7 @@ async def list_messages(
 async def send_message(
     conversation_id: str,
     body: MessageCreate,
+    rag_threshold: int | None = Query(None, description="Override RAG token threshold (for testing)"),
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
     """Send a user message and stream back the AI response via SSE."""
@@ -106,9 +107,16 @@ async def send_message(
 
     logger.info("User message saved", conversation_id=conversation_id, message_id=user_message.id)
 
-    # Load document text for the conversation
-    document = await get_document_for_conversation(session, conversation_id)
-    document_text: str | None = document.extracted_text if document else None
+    # Load all documents for the conversation
+    documents = await get_documents_for_conversation(session, conversation_id)
+
+    doc_context = await build_document_context(
+        session=session,
+        conversation_id=conversation_id,
+        user_message=body.content,
+        documents=documents,
+        rag_threshold_override=rag_threshold,
+    )
 
     # Load conversation history (exclude the message we just saved, it will be the user_message param)
     stmt = (
@@ -133,9 +141,9 @@ async def send_message(
         full_response = ""
 
         try:
-            async for chunk in chat_with_document(
+            async for chunk in chat_with_documents(
                 user_message=body.content,
-                document_text=document_text,
+                context=doc_context,
                 conversation_history=conversation_history,
             ):
                 full_response += chunk

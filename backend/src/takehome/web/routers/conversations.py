@@ -33,6 +33,15 @@ class ConversationListItem(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class DocumentInfo(BaseModel):
+    id: str
+    filename: str
+    page_count: int
+    uploaded_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class ConversationDetail(BaseModel):
     id: str
     title: str
@@ -40,15 +49,7 @@ class ConversationDetail(BaseModel):
     updated_at: datetime
     has_document: bool
     document: DocumentInfo | None = None
-
-    model_config = {"from_attributes": True}
-
-
-class DocumentInfo(BaseModel):
-    id: str
-    filename: str
-    page_count: int
-    uploaded_at: datetime
+    documents: list[DocumentInfo] = []
 
     model_config = {"from_attributes": True}
 
@@ -110,23 +111,19 @@ async def get_conversation_endpoint(
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    doc_info: DocumentInfo | None = None
-    if conversation.documents:
-        doc = conversation.documents[0]
-        doc_info = DocumentInfo(
-            id=doc.id,
-            filename=doc.filename,
-            page_count=doc.page_count,
-            uploaded_at=doc.uploaded_at,
-        )
+    all_docs = [
+        DocumentInfo(id=d.id, filename=d.filename, page_count=d.page_count, uploaded_at=d.uploaded_at)
+        for d in conversation.documents
+    ]
 
     return ConversationDetail(
         id=conversation.id,
         title=conversation.title,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
-        has_document=doc_info is not None,
-        document=doc_info,
+        has_document=len(all_docs) > 0,
+        document=all_docs[0] if all_docs else None,
+        documents=all_docs,
     )
 
 
@@ -141,23 +138,19 @@ async def update_conversation_endpoint(
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    doc_info: DocumentInfo | None = None
-    if conversation.documents:
-        doc = conversation.documents[0]
-        doc_info = DocumentInfo(
-            id=doc.id,
-            filename=doc.filename,
-            page_count=doc.page_count,
-            uploaded_at=doc.uploaded_at,
-        )
+    all_docs = [
+        DocumentInfo(id=d.id, filename=d.filename, page_count=d.page_count, uploaded_at=d.uploaded_at)
+        for d in conversation.documents
+    ]
 
     return ConversationDetail(
         id=conversation.id,
         title=conversation.title,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
-        has_document=doc_info is not None,
-        document=doc_info,
+        has_document=len(all_docs) > 0,
+        document=all_docs[0] if all_docs else None,
+        documents=all_docs,
     )
 
 

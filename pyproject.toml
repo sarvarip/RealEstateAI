@@ -22,6 +22,12 @@ dependencies = [
     "pydantic-ai-slim[anthropic]>=0.0.39",
     # Document extraction
     "pymupdf>=1.25.0",
+    # Embeddings (Azure OpenAI)
+    "openai>=1.40.0",
+    # Vector storage
+    "pgvector>=0.3.0",
+    # OCR (Azure Document Intelligence)
+    "azure-ai-documentintelligence>=1.0.0",
     # HTTP client
     "httpx>=0.27.0",
     # Settings

@@ -18,9 +18,17 @@ const DEFAULT_WIDTH = 400;
 
 interface DocumentViewerProps {
 	document: Document | null;
+	documents: Document[];
+	activeDocId: string | null;
+	onSelectDocument: (id: string) => void;
 }
 
-export function DocumentViewer({ document }: DocumentViewerProps) {
+export function DocumentViewer({
+	document,
+	documents,
+	activeDocId,
+	onSelectDocument,
+}: DocumentViewerProps) {
 	const [numPages, setNumPages] = useState<number>(0);
 	const [currentPage, setCurrentPage] = useState(1);
 	const [pdfLoading, setPdfLoading] = useState(true);
@@ -58,9 +66,19 @@ export function DocumentViewer({ document }: DocumentViewerProps) {
 		[width],
 	);
 
-	const pdfPageWidth = width - 48; // account for px-4 padding on each side
+	const handleDocSwitch = useCallback(
+		(docId: string) => {
+			onSelectDocument(docId);
+			setCurrentPage(1);
+			setPdfLoading(true);
+			setPdfError(null);
+		},
+		[onSelectDocument],
+	);
 
-	if (!document) {
+	const pdfPageWidth = width - 48;
+
+	if (documents.length === 0) {
 		return (
 			<div
 				style={{ width }}
@@ -72,7 +90,7 @@ export function DocumentViewer({ document }: DocumentViewerProps) {
 		);
 	}
 
-	const pdfUrl = getDocumentUrl(document.id);
+	const pdfUrl = document ? getDocumentUrl(document.id) : null;
 
 	return (
 		<div
@@ -88,14 +106,43 @@ export function DocumentViewer({ document }: DocumentViewerProps) {
 				onMouseDown={handleMouseDown}
 			/>
 
+			{/* Document tabs */}
+			{documents.length > 1 && (
+				<div className="flex gap-0 overflow-x-auto border-b border-neutral-100">
+					{documents.map((doc) => (
+						<button
+							key={doc.id}
+							type="button"
+							onClick={() => handleDocSwitch(doc.id)}
+							className={`flex-shrink-0 border-b-2 px-3 py-2 text-xs transition-colors ${
+								doc.id === activeDocId
+									? "border-neutral-800 bg-white text-neutral-800 font-medium"
+									: "border-transparent text-neutral-400 hover:text-neutral-600 hover:bg-neutral-50"
+							}`}
+							title={doc.filename}
+						>
+							<span className="block max-w-[120px] truncate">
+								{doc.filename.replace(".pdf", "")}
+							</span>
+						</button>
+					))}
+				</div>
+			)}
+
 			{/* Header */}
 			<div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
 				<div className="min-w-0">
 					<p className="truncate text-sm font-medium text-neutral-800">
-						{document.filename}
+						{document?.filename}
 					</p>
 					<p className="text-xs text-neutral-400">
-						{document.page_count} page{document.page_count !== 1 ? "s" : ""}
+						{document?.page_count} page{document?.page_count !== 1 ? "s" : ""}
+						{documents.length > 1 && (
+							<span>
+								{" "}
+								· {documents.length} documents in bundle
+							</span>
+						)}
 					</p>
 				</div>
 			</div>
@@ -108,35 +155,38 @@ export function DocumentViewer({ document }: DocumentViewerProps) {
 					</div>
 				)}
 
-				<PDFDocument
-					file={pdfUrl}
-					onLoadSuccess={({ numPages: pages }) => {
-						setNumPages(pages);
-						setPdfLoading(false);
-						setPdfError(null);
-					}}
-					onLoadError={(error) => {
-						setPdfError(`Failed to load PDF: ${error.message}`);
-						setPdfLoading(false);
-					}}
-					loading={
-						<div className="flex items-center justify-center py-12">
-							<Loader2 className="h-6 w-6 animate-spin text-neutral-400" />
-						</div>
-					}
-				>
-					{!pdfLoading && !pdfError && (
-						<Page
-							pageNumber={currentPage}
-							width={pdfPageWidth}
-							loading={
-								<div className="flex items-center justify-center py-12">
-									<Loader2 className="h-5 w-5 animate-spin text-neutral-300" />
-								</div>
-							}
-						/>
-					)}
-				</PDFDocument>
+				{pdfUrl && (
+					<PDFDocument
+						key={document?.id}
+						file={pdfUrl}
+						onLoadSuccess={({ numPages: pages }) => {
+							setNumPages(pages);
+							setPdfLoading(false);
+							setPdfError(null);
+						}}
+						onLoadError={(error) => {
+							setPdfError(`Failed to load PDF: ${error.message}`);
+							setPdfLoading(false);
+						}}
+						loading={
+							<div className="flex items-center justify-center py-12">
+								<Loader2 className="h-6 w-6 animate-spin text-neutral-400" />
+							</div>
+						}
+					>
+						{!pdfLoading && !pdfError && (
+							<Page
+								pageNumber={currentPage}
+								width={pdfPageWidth}
+								loading={
+									<div className="flex items-center justify-center py-12">
+										<Loader2 className="h-5 w-5 animate-spin text-neutral-300" />
+									</div>
+								}
+							/>
+						)}
+					</PDFDocument>
+				)}
 			</div>
 
 			{/* Page navigation */}
