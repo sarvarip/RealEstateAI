@@ -29,6 +29,15 @@ REAL_DOC_FILES = [
     "Rent review memorandum - 8th Fl, Building 5, New Street Sq.pdf",
 ]
 
+Q1 = "What is the rent as at today's date?"
+Q2 = "What was the rent on 15/08/2016?"
+Q3 = "What rights are granted to the tenant?"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 def _parse_sse_events(response: httpx.Response) -> list[dict]:
     """Parse all SSE events from a response into a list of dicts."""
@@ -47,14 +56,71 @@ def _parse_sse_events(response: httpx.Response) -> list[dict]:
     return events
 
 
-def _parse_sse_response(response: httpx.Response) -> str:
-    """Extract the final assistant message content from an SSE stream."""
-    for event in _parse_sse_events(response):
-        if event.get("type") == "message":
-            return event["message"]["content"]
-        if event.get("type") == "content":
-            return event.get("content", "")
-    return ""
+def _ask_question_full(
+    conv_id: str,
+    question: str,
+    rag_threshold: int | None = None,
+    retries: int = 2,
+) -> dict:
+    """Send a question and return the full message event (with segments, citations, etc.).
+
+    Retries on transient failures (missing 'message' event typically means
+    the upstream LLM had a connection error).
+    """
+    import time
+
+    params = {}
+    if rag_threshold is not None:
+        params["rag_threshold"] = rag_threshold
+
+    last_error: Exception | None = None
+    for attempt in range(1 + retries):
+        if attempt > 0:
+            time.sleep(5 * attempt)
+
+        with httpx.Client(base_url=BASE_URL, timeout=300) as client:
+            resp = client.post(
+                f"/api/conversations/{conv_id}/messages",
+                json={"content": question},
+                params=params,
+            )
+            resp.raise_for_status()
+            events = _parse_sse_events(resp)
+            for event in events:
+                if event.get("type") == "message":
+                    return event["message"]
+
+        last_error = AssertionError(
+            f"No 'message' event in SSE response (attempt {attempt + 1}). "
+            f"Events: {[e.get('type') for e in events]}"
+        )
+
+    raise last_error  # type: ignore[misc]
+
+
+def _all_citations(msg: dict) -> list[dict]:
+    """Extract a flat list of all citations from a message's segments."""
+    return [c for seg in msg.get("segments", []) for c in seg.get("citations", [])]
+
+
+def _assert_has_segments_and_citations(msg: dict, label: str = "") -> None:
+    """Common assertion: message has segments and at least one citation."""
+    prefix = f"[{label}] " if label else ""
+    segments = msg.get("segments")
+    assert segments is not None and len(segments) > 0, (
+        f"{prefix}Expected segments in response"
+    )
+    cites = _all_citations(msg)
+    assert len(cites) > 0, f"{prefix}Expected at least one citation"
+    for cite in cites:
+        assert cite.get("quote") and len(cite["quote"].strip()) > 0, (
+            f"{prefix}Citation has empty quote: {cite}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fixtures: conversation creation
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def _create_conversation_with_docs() -> str:
@@ -83,303 +149,6 @@ def _create_conversation_with_docs() -> str:
     return conv_id
 
 
-@pytest.fixture(scope="module")
-def real_docs_conversation() -> str:
-    """Shared conversation for full-context tests."""
-    return _create_conversation_with_docs()
-
-
-@pytest.fixture(scope="module")
-def rag_conversation() -> str:
-    """Separate conversation for RAG-mode tests (clean history)."""
-    return _create_conversation_with_docs()
-
-
-def _ask_question(conv_id: str, question: str, rag_threshold: int | None = None) -> str:
-    """Send a question and return the assistant's response text."""
-    params = {}
-    if rag_threshold is not None:
-        params["rag_threshold"] = rag_threshold
-
-    with httpx.Client(base_url=BASE_URL, timeout=300) as client:
-        resp = client.post(
-            f"/api/conversations/{conv_id}/messages",
-            json={"content": question},
-            params=params,
-        )
-        resp.raise_for_status()
-        return _parse_sse_response(resp)
-
-
-def _ask_question_full(conv_id: str, question: str, rag_threshold: int | None = None) -> dict:
-    """Send a question and return the full message event (with segments, citations, etc.)."""
-    params = {}
-    if rag_threshold is not None:
-        params["rag_threshold"] = rag_threshold
-
-    with httpx.Client(base_url=BASE_URL, timeout=300) as client:
-        resp = client.post(
-            f"/api/conversations/{conv_id}/messages",
-            json={"content": question},
-            params=params,
-        )
-        resp.raise_for_status()
-        events = _parse_sse_events(resp)
-        for event in events:
-            if event.get("type") == "message":
-                return event["message"]
-        raise AssertionError(f"No 'message' event found in SSE response. Events: {[e.get('type') for e in events]}")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Full-context mode (default threshold — all 3 docs fit in context)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-class TestFullContext:
-    """Tests using full-context mode (all document text sent to LLM)."""
-
-    def test_q1_current_rent(self, real_docs_conversation: str) -> None:
-        """Q1: What is the rent as at today's date?
-        Expected: £1.75 million per the Rent Review Memorandum.
-        """
-        answer = _ask_question(
-            real_docs_conversation,
-            "What is the rent as at today's date?",
-        )
-        answer_lower = answer.lower()
-        assert any(
-            term in answer_lower
-            for term in ["1.75 million", "1,750,000", "£1.75m", "1.75m", "1,750,000"]
-        ), f"Expected rent of £1.75 million not found in answer:\n{answer}"
-
-    def test_q2_rent_on_date(self, real_docs_conversation: str) -> None:
-        """Q2: What was the rent on 15/08/2016?
-        Expected: a peppercorn per the Deed of Variation.
-        Depends on text from the scanned Deed of Variation.
-        """
-        answer = _ask_question(
-            real_docs_conversation,
-            "What was the rent on 15/08/2016?",
-        )
-        answer_lower = answer.lower()
-        assert "peppercorn" in answer_lower, (
-            f"Expected 'peppercorn' in answer:\n{answer}"
-        )
-
-    def test_q3_tenant_rights(self, real_docs_conversation: str) -> None:
-        """Q3: What rights are granted to the tenant?
-        Expected: mentions rights from the lease and new/additional rights
-        from the Deed of Variation. Depends on scanned document content.
-        """
-        answer = _ask_question(
-            real_docs_conversation,
-            "What rights are granted to the tenant?",
-        )
-        answer_lower = answer.lower()
-        has_rights = "right" in answer_lower
-        has_variation_ref = any(
-            term in answer_lower
-            for term in ["deed of variation", "additional", "new right", "varied", "supplemental"]
-        )
-        assert has_rights, f"Expected discussion of rights in answer:\n{answer}"
-        assert has_variation_ref, (
-            f"Expected reference to Deed of Variation or additional/new rights in answer:\n{answer}"
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Structured citations — rent + parties from Rent Review Memo only
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-RENT_MEMO_FILE = "Rent review memorandum - 8th Fl, Building 5, New Street Sq.pdf"
-
-
-def _create_rent_memo_conversation() -> str:
-    """Create a conversation with only the Rent Review Memorandum."""
-    with httpx.Client(base_url=BASE_URL, timeout=600) as client:
-        resp = client.post("/api/conversations", json={})
-        resp.raise_for_status()
-        conv_id = resp.json()["id"]
-
-        filepath = REAL_DOCS_DIR / RENT_MEMO_FILE
-        if not filepath.exists():
-            pytest.skip(f"Real doc not found: {filepath}")
-        with open(filepath, "rb") as f:
-            resp = client.post(
-                f"/api/conversations/{conv_id}/documents",
-                files={"file": (RENT_MEMO_FILE, f, "application/pdf")},
-            )
-            resp.raise_for_status()
-
-    return conv_id
-
-
-@pytest.fixture(scope="module")
-def rent_memo_conversation() -> str:
-    """Conversation with only the Rent Review Memorandum uploaded."""
-    return _create_rent_memo_conversation()
-
-
-_STRUCTURED_QUESTION = "What is the current rent and who are the current parties (landlord and tenant)?"
-
-_cached_structured_response: dict | None = None
-
-
-def _get_structured_response(conv_id: str) -> dict:
-    """Ask the structured-citations question once and cache the result for all tests."""
-    global _cached_structured_response
-    if _cached_structured_response is None:
-        _cached_structured_response = _ask_question_full(conv_id, _STRUCTURED_QUESTION)
-    return _cached_structured_response
-
-
-class TestStructuredCitations:
-    """Validate that the structured-output pipeline returns correct segments and citations."""
-
-    def test_rent_and_parties_answer(self, rent_memo_conversation: str) -> None:
-        """The answer text must mention rent, landlord, and tenant."""
-        msg = _get_structured_response(rent_memo_conversation)
-
-        answer_lower = msg["content"].lower()
-
-        assert any(
-            t in answer_lower for t in ["1,750,000", "1.75 million", "1.75m"]
-        ), f"Expected rent amount in answer:\n{msg['content']}"
-
-        assert "city of london" in answer_lower or "real property" in answer_lower, (
-            f"Expected landlord name in answer:\n{msg['content']}"
-        )
-
-        assert "stewarts" in answer_lower, (
-            f"Expected tenant name (Stewarts Law) in answer:\n{msg['content']}"
-        )
-
-    def test_segments_present(self, rent_memo_conversation: str) -> None:
-        """The response must include structured segments (not just flat content)."""
-        msg = _get_structured_response(rent_memo_conversation)
-
-        segments = msg.get("segments")
-        assert segments is not None, "Expected 'segments' in message response"
-        assert len(segments) >= 2, (
-            f"Expected at least 2 segments (rent + parties), got {len(segments)}"
-        )
-
-    def test_each_segment_has_citations(self, rent_memo_conversation: str) -> None:
-        """Every segment containing a specific factual claim should have at least one citation."""
-        msg = _get_structured_response(rent_memo_conversation)
-
-        segments = msg.get("segments", [])
-        factual_keywords = ["1,750,000", "1.75", "stewarts", "city of london", "real property"]
-        factual_without_cite = []
-        for seg in segments:
-            text_lower = seg["text"].lower()
-            has_factual_claim = any(kw in text_lower for kw in factual_keywords)
-            if has_factual_claim and len(seg.get("citations", [])) == 0:
-                factual_without_cite.append(seg["text"])
-
-        assert not factual_without_cite, (
-            f"Factual segments missing citations:\n" +
-            "\n".join(f"  - {t}" for t in factual_without_cite)
-        )
-
-    def test_citations_reference_rent_memo(self, rent_memo_conversation: str) -> None:
-        """All citations should reference the Rent Review Memorandum."""
-        msg = _get_structured_response(rent_memo_conversation)
-
-        segments = msg.get("segments", [])
-        for seg in segments:
-            for cite in seg.get("citations", []):
-                assert "rent review" in cite["filename"].lower(), (
-                    f"Citation references wrong file: {cite['filename']}"
-                )
-
-    def test_citations_have_quotes(self, rent_memo_conversation: str) -> None:
-        """Every citation must include a non-empty quote."""
-        msg = _get_structured_response(rent_memo_conversation)
-
-        segments = msg.get("segments", [])
-        for seg in segments:
-            for cite in seg.get("citations", []):
-                assert cite.get("quote") and len(cite["quote"].strip()) > 0, (
-                    f"Citation in segment '{seg['text'][:50]}...' has empty quote"
-                )
-
-    def test_citations_are_verified(self, rent_memo_conversation: str) -> None:
-        """Citations should be verified against the source document."""
-        msg = _get_structured_response(rent_memo_conversation)
-
-        segments = msg.get("segments", [])
-        all_cites = [c for seg in segments for c in seg.get("citations", [])]
-        verified = [c for c in all_cites if c.get("verified")]
-
-        assert len(verified) > 0, "Expected at least one verified citation"
-        assert len(verified) == len(all_cites), (
-            f"Only {len(verified)}/{len(all_cites)} citations verified"
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# RAG mode (forced by setting threshold to 1000 tokens)
-# ──────────────────────────────────────────────────────────────────────────────
-
-RAG_THRESHOLD = 1000
-
-
-class TestRAGMode:
-    """Tests using RAG mode (forced via low threshold of 1000 tokens)."""
-
-    def test_q1_current_rent_rag(self, rag_conversation: str) -> None:
-        """Q1 via RAG: What is the rent as at today's date?"""
-        answer = _ask_question(
-            rag_conversation,
-            "What is the rent as at today's date?",
-            rag_threshold=RAG_THRESHOLD,
-        )
-        answer_lower = answer.lower()
-        assert any(
-            term in answer_lower
-            for term in ["1.75 million", "1,750,000", "£1.75m", "1.75m", "1,750,000"]
-        ), f"[RAG] Expected rent of £1.75 million not found in answer:\n{answer}"
-
-    def test_q2_rent_on_date_rag(self, rag_conversation: str) -> None:
-        """Q2 via RAG: What was the rent on 15/08/2016?"""
-        answer = _ask_question(
-            rag_conversation,
-            "What was the rent on 15/08/2016?",
-            rag_threshold=RAG_THRESHOLD,
-        )
-        answer_lower = answer.lower()
-        assert "peppercorn" in answer_lower, (
-            f"[RAG] Expected 'peppercorn' in answer:\n{answer}"
-        )
-
-    def test_q3_tenant_rights_rag(self, rag_conversation: str) -> None:
-        """Q3 via RAG: What rights are granted to the tenant?"""
-        answer = _ask_question(
-            rag_conversation,
-            "What rights are granted to the tenant?",
-            rag_threshold=RAG_THRESHOLD,
-        )
-        answer_lower = answer.lower()
-        has_rights = "right" in answer_lower
-        has_variation_ref = any(
-            term in answer_lower
-            for term in ["deed of variation", "additional", "new right", "varied", "supplemental"]
-        )
-        assert has_rights, f"[RAG] Expected discussion of rights in answer:\n{answer}"
-        assert has_variation_ref, (
-            f"[RAG] Expected reference to additional/new rights in answer:\n{answer}"
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# No-Azure mode: Anthropic vision OCR, no embeddings, full-context only
-# Only uploads the Deed (12 image pages) and Rent Review Memo (text-only)
-# to keep the test fast. Skips the 140-page Lease.
-# ──────────────────────────────────────────────────────────────────────────────
-
 NO_AZURE_DOC_FILES = [
     "Official Copy (NGL885533 - Deed - 31-03-2016).pdf",
     "Rent review memorandum - 8th Fl, Building 5, New Street Sq.pdf",
@@ -387,12 +156,7 @@ NO_AZURE_DOC_FILES = [
 
 
 def _create_conversation_no_azure() -> str:
-    """Create a conversation with only Deed + Rent Review, no Azure services.
-
-    Uses query params to skip embedding and force Anthropic vision OCR,
-    simulating an environment with only an Anthropic API key.
-    Only uploads 2 smaller docs (not the 140-page Lease) to stay fast.
-    """
+    """Create a conversation with only Deed + Rent Review, no Azure services."""
     with httpx.Client(base_url=BASE_URL, timeout=300) as client:
         resp = client.post("/api/conversations", json={})
         resp.raise_for_status()
@@ -422,47 +186,352 @@ def _create_conversation_no_azure() -> str:
     return conv_id
 
 
+RENT_MEMO_FILE = "Rent review memorandum - 8th Fl, Building 5, New Street Sq.pdf"
+
+
+def _create_rent_memo_conversation() -> str:
+    """Create a conversation with only the Rent Review Memorandum."""
+    with httpx.Client(base_url=BASE_URL, timeout=600) as client:
+        resp = client.post("/api/conversations", json={})
+        resp.raise_for_status()
+        conv_id = resp.json()["id"]
+
+        filepath = REAL_DOCS_DIR / RENT_MEMO_FILE
+        if not filepath.exists():
+            pytest.skip(f"Real doc not found: {filepath}")
+        with open(filepath, "rb") as f:
+            resp = client.post(
+                f"/api/conversations/{conv_id}/documents",
+                files={"file": (RENT_MEMO_FILE, f, "application/pdf")},
+            )
+            resp.raise_for_status()
+
+    return conv_id
+
+
+@pytest.fixture(scope="module")
+def real_docs_conversation() -> str:
+    return _create_conversation_with_docs()
+
+
+@pytest.fixture(scope="module")
+def rag_conversation() -> str:
+    return _create_conversation_with_docs()
+
+
 @pytest.fixture(scope="module")
 def no_azure_conversation() -> str:
-    """Conversation created without any Azure services (Anthropic-only)."""
     return _create_conversation_no_azure()
 
 
+@pytest.fixture(scope="module")
+def rent_memo_conversation() -> str:
+    return _create_rent_memo_conversation()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Response caches — one LLM call per question per test suite
+# ──────────────────────────────────────────────────────────────────────────────
+
+_cache_full: dict[str, dict] = {}
+_cache_rag: dict[str, dict] = {}
+_cache_noazure: dict[str, dict] = {}
+_cache_structured: dict | None = None
+
+
+def _get_full(conv_id: str, question: str) -> dict:
+    if question not in _cache_full:
+        _cache_full[question] = _ask_question_full(conv_id, question)
+    return _cache_full[question]
+
+
+def _get_rag(conv_id: str, question: str) -> dict:
+    if question not in _cache_rag:
+        _cache_rag[question] = _ask_question_full(conv_id, question, rag_threshold=1000)
+    return _cache_rag[question]
+
+
+def _get_noazure(conv_id: str, question: str) -> dict:
+    if question not in _cache_noazure:
+        _cache_noazure[question] = _ask_question_full(
+            conv_id, question, rag_threshold=9_999_999,
+        )
+    return _cache_noazure[question]
+
+
+def _get_structured(conv_id: str) -> dict:
+    global _cache_structured
+    if _cache_structured is None:
+        _cache_structured = _ask_question_full(
+            conv_id,
+            "What is the current rent and who are the current parties (landlord and tenant)?",
+        )
+    return _cache_structured
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Full-context mode (default threshold — all 3 docs fit in context)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestFullContext:
+    """Tests using full-context mode (all document text sent to LLM)."""
+
+    def test_q1_current_rent(self, real_docs_conversation: str) -> None:
+        """Q1: answer mentions £1.75 million."""
+        msg = _get_full(real_docs_conversation, Q1)
+        assert any(
+            t in msg["content"].lower()
+            for t in ["1.75 million", "1,750,000", "£1.75m", "1.75m"]
+        ), f"Expected rent of £1.75 million not found in answer:\n{msg['content']}"
+
+    def test_q1_citations(self, real_docs_conversation: str) -> None:
+        """Q1: has segments with citations referencing the Rent Review Memo."""
+        msg = _get_full(real_docs_conversation, Q1)
+        _assert_has_segments_and_citations(msg, "FullContext Q1")
+        cites = _all_citations(msg)
+        rent_cites = [c for c in cites if "rent review" in c["filename"].lower()]
+        assert len(rent_cites) > 0, (
+            f"Expected at least one citation from Rent Review Memo, got filenames: "
+            f"{[c['filename'] for c in cites]}"
+        )
+
+    def test_q2_rent_on_date(self, real_docs_conversation: str) -> None:
+        """Q2: answer mentions peppercorn."""
+        msg = _get_full(real_docs_conversation, Q2)
+        assert "peppercorn" in msg["content"].lower(), (
+            f"Expected 'peppercorn' in answer:\n{msg['content']}"
+        )
+
+    def test_q2_citations(self, real_docs_conversation: str) -> None:
+        """Q2: has citations referencing the Deed of Variation."""
+        msg = _get_full(real_docs_conversation, Q2)
+        _assert_has_segments_and_citations(msg, "FullContext Q2")
+        cites = _all_citations(msg)
+        deed_cites = [
+            c for c in cites
+            if "deed" in c["filename"].lower() or "official" in c["filename"].lower()
+        ]
+        assert len(deed_cites) > 0, (
+            f"Expected at least one citation from the Deed, got filenames: "
+            f"{[c['filename'] for c in cites]}"
+        )
+
+    def test_q3_tenant_rights(self, real_docs_conversation: str) -> None:
+        """Q3: answer mentions rights and deed of variation."""
+        msg = _get_full(real_docs_conversation, Q3)
+        lower = msg["content"].lower()
+        assert "right" in lower, f"Expected 'right' in answer:\n{msg['content']}"
+        assert any(
+            t in lower
+            for t in ["deed of variation", "additional", "new right", "varied", "supplemental"]
+        ), f"Expected reference to Deed of Variation in answer:\n{msg['content']}"
+
+    def test_q3_citations(self, real_docs_conversation: str) -> None:
+        """Q3: has citations (likely from Lease and/or Deed)."""
+        msg = _get_full(real_docs_conversation, Q3)
+        _assert_has_segments_and_citations(msg, "FullContext Q3")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Structured citations — rent + parties from Rent Review Memo only
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestStructuredCitations:
+    """Validate the structured-output pipeline with a single-doc question."""
+
+    def test_rent_and_parties_answer(self, rent_memo_conversation: str) -> None:
+        msg = _get_structured(rent_memo_conversation)
+        lower = msg["content"].lower()
+        assert any(t in lower for t in ["1,750,000", "1.75 million", "1.75m"])
+        assert "city of london" in lower or "real property" in lower
+        assert "stewarts" in lower
+
+    def test_segments_present(self, rent_memo_conversation: str) -> None:
+        msg = _get_structured(rent_memo_conversation)
+        segments = msg.get("segments")
+        assert segments is not None and len(segments) >= 2
+
+    def test_each_factual_segment_has_citations(self, rent_memo_conversation: str) -> None:
+        msg = _get_structured(rent_memo_conversation)
+        factual_kw = ["1,750,000", "1.75", "stewarts", "city of london", "real property"]
+        for seg in msg.get("segments", []):
+            text_lower = seg["text"].lower()
+            if any(kw in text_lower for kw in factual_kw):
+                assert len(seg.get("citations", [])) > 0, (
+                    f"Factual segment missing citation: {seg['text'][:80]}"
+                )
+
+    def test_citations_reference_rent_memo(self, rent_memo_conversation: str) -> None:
+        msg = _get_structured(rent_memo_conversation)
+        for cite in _all_citations(msg):
+            assert "rent review" in cite["filename"].lower()
+
+    def test_citations_have_quotes_and_verified(self, rent_memo_conversation: str) -> None:
+        msg = _get_structured(rent_memo_conversation)
+        cites = _all_citations(msg)
+        assert len(cites) > 0
+        for cite in cites:
+            assert cite.get("quote") and len(cite["quote"].strip()) > 0
+            assert cite.get("verified"), f"Citation not verified: {cite}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RAG mode (forced by setting threshold to 1000 tokens)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestRAGMode:
+    """Tests using RAG mode (forced via low threshold of 1000 tokens)."""
+
+    def test_q1_current_rent_rag(self, rag_conversation: str) -> None:
+        msg = _get_rag(rag_conversation, Q1)
+        assert any(
+            t in msg["content"].lower()
+            for t in ["1.75 million", "1,750,000", "£1.75m", "1.75m"]
+        ), f"[RAG] Expected rent of £1.75 million:\n{msg['content']}"
+
+    def test_q1_citations_rag(self, rag_conversation: str) -> None:
+        msg = _get_rag(rag_conversation, Q1)
+        _assert_has_segments_and_citations(msg, "RAG Q1")
+
+    def test_q2_rent_on_date_rag(self, rag_conversation: str) -> None:
+        msg = _get_rag(rag_conversation, Q2)
+        assert "peppercorn" in msg["content"].lower(), (
+            f"[RAG] Expected 'peppercorn':\n{msg['content']}"
+        )
+
+    def test_q2_citations_rag(self, rag_conversation: str) -> None:
+        msg = _get_rag(rag_conversation, Q2)
+        _assert_has_segments_and_citations(msg, "RAG Q2")
+
+    def test_q3_tenant_rights_rag(self, rag_conversation: str) -> None:
+        msg = _get_rag(rag_conversation, Q3)
+        lower = msg["content"].lower()
+        assert "right" in lower
+        assert any(
+            t in lower
+            for t in ["deed of variation", "additional", "new right", "varied", "supplemental"]
+        ), f"[RAG] Expected reference to additional/new rights in answer:\n{msg['content']}"
+
+    def test_q3_citations_rag(self, rag_conversation: str) -> None:
+        msg = _get_rag(rag_conversation, Q3)
+        _assert_has_segments_and_citations(msg, "RAG Q3")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# No-Azure mode: Anthropic vision OCR, no embeddings, full-context only
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 class TestNoAzureKeys:
-    """Tests simulating an environment with only the Anthropic API key.
-
-    Uploads only the Deed of Variation (12 scanned pages → Anthropic vision OCR)
-    and the Rent Review Memo (text-based, no OCR needed).
-    All queries use full-context mode since embeddings were skipped.
-    """
-
-    FULL_CONTEXT_THRESHOLD = 9_999_999
+    """Tests with only the Anthropic API key (no Azure)."""
 
     def test_q1_current_rent_no_azure(self, no_azure_conversation: str) -> None:
-        """Q1: What is the rent as at today's date? (Anthropic-only pipeline)
-        Answer comes from text-based Rent Review Memo — no OCR needed.
-        """
-        answer = _ask_question(
-            no_azure_conversation,
-            "What is the rent as at today's date?",
-            rag_threshold=self.FULL_CONTEXT_THRESHOLD,
-        )
-        answer_lower = answer.lower()
+        msg = _get_noazure(no_azure_conversation, Q1)
         assert any(
-            term in answer_lower
-            for term in ["1.75 million", "1,750,000", "£1.75m", "1.75m", "1,750,000"]
-        ), f"[NoAzure] Expected rent of £1.75 million not found in answer:\n{answer}"
+            t in msg["content"].lower()
+            for t in ["1.75 million", "1,750,000", "£1.75m", "1.75m"]
+        ), f"[NoAzure] Expected rent of £1.75 million:\n{msg['content']}"
+
+    def test_q1_citations_no_azure(self, no_azure_conversation: str) -> None:
+        msg = _get_noazure(no_azure_conversation, Q1)
+        _assert_has_segments_and_citations(msg, "NoAzure Q1")
 
     def test_q2_rent_on_date_no_azure(self, no_azure_conversation: str) -> None:
-        """Q2: What was the rent on 15/08/2016? (Anthropic vision OCR)
-        Answer (peppercorn) comes from the scanned Deed of Variation.
-        """
-        answer = _ask_question(
-            no_azure_conversation,
-            "What was the rent on 15/08/2016?",
-            rag_threshold=self.FULL_CONTEXT_THRESHOLD,
+        msg = _get_noazure(no_azure_conversation, Q2)
+        assert "peppercorn" in msg["content"].lower(), (
+            f"[NoAzure] Expected 'peppercorn':\n{msg['content']}"
         )
-        answer_lower = answer.lower()
-        assert "peppercorn" in answer_lower, (
-            f"[NoAzure] Expected 'peppercorn' in answer:\n{answer}"
+
+    def test_q2_citations_no_azure(self, no_azure_conversation: str) -> None:
+        """Q2 answer comes from the scanned Deed — citation quote may come from OCR text."""
+        msg = _get_noazure(no_azure_conversation, Q2)
+        _assert_has_segments_and_citations(msg, "NoAzure Q2")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Secondary verification — inexact quote triggers fallback LLM correction
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestSecondaryVerification:
+    """Test that the secondary LLM verification recovers from inexact quotes.
+
+    We manually construct a Citation with a paraphrased (non-verbatim) quote
+    that will fail primary substring verification, then confirm the secondary
+    LLM call finds and corrects it.
+    """
+
+    FAKE_PAGE_TEXT = (
+        "--- Page 1 ---\n"
+        "Lease particulars\n"
+        "Date: 6 June 2008\n"
+        "Original Parties:\n"
+        "Landlord: The City of London Real Property Company Limited\n"
+        "Tenant: Taylor Wessing LLP\n"
+        "Property: Eighth Floor, Building 5, New Street Square, "
+        "New Fetter Lane, London EC4\n"
+        "Annual rent reserved prior to the review recorded in this memorandum "
+        "(exclusive of any VAT): one million three hundred and sixty one thousand "
+        "eight hundred and thirty three pounds (£1,361,833)\n"
+        "Current landlord: The City of London Real Property Company Limited\n"
+        "Current tenant: Stewarts Law LLP\n"
+        "The current landlord and the current tenant record that the rent reserved "
+        "under the lease has been reviewed in accordance with the lease and agreed "
+        "at an annual rent of one million seven hundred and fifty thousand pounds "
+        "(£1,750,000) (exclusive of any VAT) with effect from 25 March 2021.\n"
+    )
+
+    INEXACT_QUOTE = (
+        "the annual rent has been agreed at one million seven hundred "
+        "and fifty thousand pounds with effect from March 2021"
+    )
+
+    def test_primary_fails_on_inexact_quote(self) -> None:
+        """Primary (substring) verification should FAIL for a paraphrased quote."""
+        from dataclasses import dataclass
+        from takehome.services.llm import Citation, verify_citations
+
+        @dataclass
+        class FakeDoc:
+            id: str = "fake-doc-id"
+            filename: str = "Rent review memorandum.pdf"
+            extracted_text: str = ""
+            page_count: int = 1
+
+        cite = Citation(
+            index=1, filename="Rent review memorandum.pdf", page=1,
+            quote=self.INEXACT_QUOTE, document_id="fake-doc-id", verified=False,
+        )
+        verify_citations([cite], [FakeDoc(extracted_text=self.FAKE_PAGE_TEXT)])
+        assert not cite.verified, "Primary should FAIL for paraphrased quote"
+
+    def test_secondary_corrects_inexact_quote(self) -> None:
+        """Secondary LLM verification should find matching text and correct the quote."""
+        import asyncio
+        from dataclasses import dataclass
+        from takehome.services.llm import Citation, verify_citations, verify_citations_secondary
+
+        @dataclass
+        class FakeDoc:
+            id: str = "fake-doc-id"
+            filename: str = "Rent review memorandum.pdf"
+            extracted_text: str = ""
+            page_count: int = 1
+
+        cite = Citation(
+            index=1, filename="Rent review memorandum.pdf", page=1,
+            quote=self.INEXACT_QUOTE, document_id="fake-doc-id", verified=False,
+        )
+        fake_doc = FakeDoc(extracted_text=self.FAKE_PAGE_TEXT)
+        verify_citations([cite], [fake_doc])
+
+        corrected = asyncio.run(verify_citations_secondary([cite], [fake_doc]))
+        cite = corrected[0]
+
+        assert cite.verified, "Secondary verification should mark the citation as verified"
+        assert cite.quote != self.INEXACT_QUOTE, (
+            f"Expected corrected quote, still: {cite.quote}"
         )
