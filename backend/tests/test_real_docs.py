@@ -535,3 +535,38 @@ class TestSecondaryVerification:
         assert cite.quote != self.INEXACT_QUOTE, (
             f"Expected corrected quote, still: {cite.quote}"
         )
+
+    def test_hallucinated_quote_stays_unverified(self) -> None:
+        """A completely fabricated quote should remain unverified after both passes."""
+        import asyncio
+        from dataclasses import dataclass
+        from takehome.services.llm import Citation, verify_citations, verify_citations_secondary
+
+        @dataclass
+        class FakeDoc:
+            id: str = "fake-doc-id"
+            filename: str = "Rent review memorandum.pdf"
+            extracted_text: str = ""
+            page_count: int = 1
+
+        hallucinated_quote = (
+            "the tenant shall pay a security deposit of five hundred "
+            "thousand pounds upon execution of this agreement"
+        )
+
+        cite = Citation(
+            index=1, filename="Rent review memorandum.pdf", page=1,
+            quote=hallucinated_quote, document_id="fake-doc-id", verified=False,
+        )
+        fake_doc = FakeDoc(extracted_text=self.FAKE_PAGE_TEXT)
+
+        verify_citations([cite], [fake_doc])
+        assert not cite.verified, "Primary should FAIL for hallucinated quote"
+
+        corrected = asyncio.run(verify_citations_secondary([cite], [fake_doc]))
+        cite = corrected[0]
+
+        assert not cite.verified, (
+            "Hallucinated quote should remain UNVERIFIED after both passes — "
+            "this would display as an amber warning chip in the frontend"
+        )
