@@ -24,7 +24,7 @@ export function ChatSidebar({
 	const [hoveredId, setHoveredId] = useState<string | null>(null);
 
 	return (
-		<div className="flex h-full w-[250px] flex-shrink-0 flex-col border-r border-neutral-200 bg-white">
+		<div className="flex h-full w-[clamp(180px,16vw,280px)] flex-shrink-0 flex-col border-r border-neutral-200 bg-white">
 			<div className="flex items-center justify-between border-b border-neutral-100 p-3">
 				<span className="text-sm font-semibold text-neutral-700">Chats</span>
 				<Button variant="ghost" size="icon" onClick={onCreate} title="New chat">

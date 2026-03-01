@@ -18,9 +18,14 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 	import.meta.url,
 ).toString();
 
-const MIN_WIDTH = 280;
-const MAX_WIDTH = 700;
-const DEFAULT_WIDTH = 400;
+function getResponsiveDefaults() {
+	const vw = typeof window !== "undefined" ? window.innerWidth : 1440;
+	return {
+		min: Math.round(Math.max(220, vw * 0.18)),
+		max: Math.round(Math.min(700, vw * 0.45)),
+		initial: Math.round(Math.max(280, Math.min(vw * 0.3, 500))),
+	};
+}
 
 function normalizeForMatch(text: string): string {
 	return text
@@ -50,11 +55,12 @@ export function DocumentViewer({
 	highlightText,
 	onClearHighlight,
 }: DocumentViewerProps) {
+	const [responsiveDefaults] = useState(getResponsiveDefaults);
 	const [numPages, setNumPages] = useState<number>(0);
 	const [currentPage, setCurrentPage] = useState(1);
 	const [pdfLoading, setPdfLoading] = useState(true);
 	const [pdfError, setPdfError] = useState<string | null>(null);
-	const [width, setWidth] = useState(DEFAULT_WIDTH);
+	const [width, setWidth] = useState(responsiveDefaults.initial);
 	const [dragging, setDragging] = useState(false);
 	const containerRef = useRef<HTMLDivElement>(null);
 
@@ -134,8 +140,8 @@ export function DocumentViewer({
 			const handleMouseMove = (moveEvent: MouseEvent) => {
 				const delta = startX - moveEvent.clientX;
 				const newWidth = Math.min(
-					MAX_WIDTH,
-					Math.max(MIN_WIDTH, startWidth + delta),
+					responsiveDefaults.max,
+					Math.max(responsiveDefaults.min, startWidth + delta),
 				);
 				setWidth(newWidth);
 			};
