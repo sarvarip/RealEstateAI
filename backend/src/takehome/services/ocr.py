@@ -23,7 +23,8 @@ from takehome.config import settings
 
 logger = structlog.get_logger()
 
-ANTHROPIC_CONCURRENCY = 10
+ANTHROPIC_CONCURRENCY = 5
+ANTHROPIC_MAX_RETRIES = 6
 OCR_CACHE_DIR = os.path.join(settings.upload_dir, ".ocr_cache")
 
 
@@ -158,6 +159,8 @@ async def _ocr_anthropic_vision(file_path: str, page_numbers: list[int]) -> dict
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
     semaphore = asyncio.Semaphore(ANTHROPIC_CONCURRENCY)
 
+    max_image_bytes = 4 * 1024 * 1024  # 4MB safety margin under Anthropic's 5MB limit
+
     doc = fitz.open(file_path)
     page_images: list[tuple[int, str]] = []
     for page_num in page_numbers:
@@ -165,8 +168,13 @@ async def _ocr_anthropic_vision(file_path: str, page_numbers: list[int]) -> dict
         if page_idx < 0 or page_idx >= len(doc):
             continue
         page = doc[page_idx]
-        pix = page.get_pixmap(dpi=150)  # type: ignore[union-attr]
+        dpi = 150
+        pix = page.get_pixmap(dpi=dpi)  # type: ignore[union-attr]
         png_bytes = pix.tobytes("png")
+        while len(png_bytes) > max_image_bytes and dpi > 72:
+            dpi -= 20
+            pix = page.get_pixmap(dpi=dpi)  # type: ignore[union-attr]
+            png_bytes = pix.tobytes("png")
         b64_image = base64.b64encode(png_bytes).decode("utf-8")
         page_images.append((page_num, b64_image))
     doc.close()
@@ -174,45 +182,48 @@ async def _ocr_anthropic_vision(file_path: str, page_numbers: list[int]) -> dict
     logger.info("Rendered page images", count=len(page_images))
 
     async def _process_page(page_num: int, b64: str) -> tuple[int, str | None]:
-        async with semaphore:
-            try:
-                response = await client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=4096,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/png",
-                                        "data": b64,
+        for attempt in range(ANTHROPIC_MAX_RETRIES):
+            async with semaphore:
+                try:
+                    response = await client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=4096,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": b64,
+                                        },
                                     },
-                                },
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "Extract ALL text from this scanned document page. "
-                                        "Preserve the original structure including headings, "
-                                        "paragraphs, numbering, and any tabular data. "
-                                        "Return only the extracted text, no commentary."
-                                    ),
-                                },
-                            ],
-                        }
-                    ],
-                )
-                text = response.content[0].text  # type: ignore[union-attr]
-                return (page_num, text if text.strip() else None)
-            except anthropic.RateLimitError:
-                logger.warning("Anthropic rate limit hit", page=page_num)
-                await asyncio.sleep(5)
-                return (page_num, None)
-            except Exception:
-                logger.exception("Anthropic vision OCR failed for page", page=page_num)
-                return (page_num, None)
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "Extract ALL text from this scanned document page. "
+                                            "Preserve the original structure including headings, "
+                                            "paragraphs, numbering, and any tabular data. "
+                                            "Return only the extracted text, no commentary."
+                                        ),
+                                    },
+                                ],
+                            }
+                        ],
+                    )
+                    text = response.content[0].text  # type: ignore[union-attr]
+                    return (page_num, text if text.strip() else None)
+                except anthropic.RateLimitError:
+                    backoff = min(2 ** attempt * 2, 60)
+                    logger.warning("Anthropic rate limit hit, retrying", page=page_num, attempt=attempt + 1, backoff_s=backoff)
+                    await asyncio.sleep(backoff)
+                except Exception:
+                    logger.exception("Anthropic vision OCR failed for page", page=page_num)
+                    return (page_num, None)
+        logger.error("Anthropic OCR exhausted retries", page=page_num)
+        return (page_num, None)
 
     results = await asyncio.gather(*[
         _process_page(pn, b64) for pn, b64 in page_images
