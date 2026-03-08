@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -489,10 +490,8 @@ class TestSecondaryVerification:
         "and fifty thousand pounds with effect from March 2021"
     )
 
-    def test_primary_fails_on_inexact_quote(self) -> None:
-        """Primary (substring) verification should FAIL for a paraphrased quote."""
+    def _make_fake_doc(self, extracted_text: str = "") -> Any:
         from dataclasses import dataclass
-        from takehome.services.llm import Citation, verify_citations
 
         @dataclass
         class FakeDoc:
@@ -501,31 +500,30 @@ class TestSecondaryVerification:
             extracted_text: str = ""
             page_count: int = 1
 
+        return FakeDoc(extracted_text=extracted_text)
+
+    def test_primary_fails_on_inexact_quote(self) -> None:
+        """Primary (substring) verification should FAIL for a paraphrased quote."""
+        from takehome.services.llm import Citation, verify_citations
+
         cite = Citation(
             index=1, filename="Rent review memorandum.pdf", page=1,
             quote=self.INEXACT_QUOTE, document_id="fake-doc-id", verified=False,
         )
-        verify_citations([cite], [FakeDoc(extracted_text=self.FAKE_PAGE_TEXT)])
+        verify_citations([cite], [self._make_fake_doc(self.FAKE_PAGE_TEXT)])
         assert not cite.verified, "Primary should FAIL for paraphrased quote"
 
     def test_secondary_corrects_inexact_quote(self) -> None:
         """Secondary LLM verification should find matching text and correct the quote."""
         import asyncio
-        from dataclasses import dataclass
-        from takehome.services.llm import Citation, verify_citations, verify_citations_secondary
 
-        @dataclass
-        class FakeDoc:
-            id: str = "fake-doc-id"
-            filename: str = "Rent review memorandum.pdf"
-            extracted_text: str = ""
-            page_count: int = 1
+        from takehome.services.llm import Citation, verify_citations, verify_citations_secondary
 
         cite = Citation(
             index=1, filename="Rent review memorandum.pdf", page=1,
             quote=self.INEXACT_QUOTE, document_id="fake-doc-id", verified=False,
         )
-        fake_doc = FakeDoc(extracted_text=self.FAKE_PAGE_TEXT)
+        fake_doc = self._make_fake_doc(self.FAKE_PAGE_TEXT)
         verify_citations([cite], [fake_doc])
 
         corrected = asyncio.run(verify_citations_secondary([cite], [fake_doc]))
@@ -539,15 +537,8 @@ class TestSecondaryVerification:
     def test_hallucinated_quote_stays_unverified(self) -> None:
         """A completely fabricated quote should remain unverified after both passes."""
         import asyncio
-        from dataclasses import dataclass
-        from takehome.services.llm import Citation, verify_citations, verify_citations_secondary
 
-        @dataclass
-        class FakeDoc:
-            id: str = "fake-doc-id"
-            filename: str = "Rent review memorandum.pdf"
-            extracted_text: str = ""
-            page_count: int = 1
+        from takehome.services.llm import Citation, verify_citations, verify_citations_secondary
 
         hallucinated_quote = (
             "the tenant shall pay a security deposit of five hundred "
@@ -558,7 +549,7 @@ class TestSecondaryVerification:
             index=1, filename="Rent review memorandum.pdf", page=1,
             quote=hallucinated_quote, document_id="fake-doc-id", verified=False,
         )
-        fake_doc = FakeDoc(extracted_text=self.FAKE_PAGE_TEXT)
+        fake_doc = self._make_fake_doc(self.FAKE_PAGE_TEXT)
 
         verify_citations([cite], [fake_doc])
         assert not cite.verified, "Primary should FAIL for hallucinated quote"
