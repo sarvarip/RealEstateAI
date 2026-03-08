@@ -196,6 +196,57 @@ async def get_page(ctx: RunContext[AgentDeps], filename: str, page: int) -> str:
     return f'<page filename="{doc.filename}" page="{page}">\n{page_text.strip()}\n</page>'
 
 
+@agentic_agent.tool
+async def get_report_guidelines(ctx: RunContext[AgentDeps], report_type: str = "report_on_title") -> str:
+    """Get the structure and guidelines for generating a formal legal report.
+
+    Call this when the user asks for a report, writeup, summary document,
+    or any structured documentation of the property/lease. The guidelines
+    specify which sections to include and what to cover in each.
+
+    Args:
+        report_type: Type of report. Currently supported: "report_on_title".
+    """
+    if ctx.deps.on_tool_call:
+        await ctx.deps.on_tool_call("planning", {"report_type": report_type})
+
+    logger.info("get_report_guidelines tool called", report_type=report_type)
+
+    return _REPORT_GUIDELINES.get(report_type, _REPORT_GUIDELINES["report_on_title"])
+
+
+_REPORT_GUIDELINES: dict[str, str] = {
+    "report_on_title": (
+        "You are generating a Report on Title for a commercial property.\n\n"
+        "STRUCTURE: Produce the following sections in order. For each section, "
+        "use search_documents() to find relevant content, then get_page() to verify "
+        "exact quotes. Create a header segment (e.g. '**1. Property**') with no "
+        "citations, followed by one or more content segments with citations.\n\n"
+        "SECTIONS:\n"
+        "1. **Property** — Address, description, and floor area.\n"
+        "2. **Title** — Title number, registered proprietor, class of title.\n"
+        "3. **Tenure** — Freehold or leasehold, term, commencement date.\n"
+        "4. **Parties** — Current landlord and tenant (and any predecessors).\n"
+        "5. **Rent** — Current passing rent, review dates, review mechanism.\n"
+        "6. **Rent Review** — Basis of review (open market, RPI, etc.), most recent review.\n"
+        "7. **Break Clauses** — Any tenant or landlord break rights, conditions, notice periods.\n"
+        "8. **Permitted Use** — Authorised use under the lease.\n"
+        "9. **Alienation** — Assignment, subletting, sharing restrictions.\n"
+        "10. **Repair & Insurance** — Repairing obligations, insurance responsibility.\n"
+        "11. **Service Charge** — Basis, cap, any disputes.\n"
+        "12. **Key Dates** — Summary of critical upcoming dates.\n\n"
+        "GUIDELINES:\n"
+        "- Skip any section where the documents contain no relevant information, "
+        "but note it was not found.\n"
+        "- If a section has information across multiple documents, cross-reference "
+        "and note any discrepancies.\n"
+        "- Every factual claim must have a citation with a verbatim quote.\n"
+        "- The user may have asked to focus on or skip certain sections — follow "
+        "their instructions.\n"
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Title generation (uses cheap Haiku)
 # ---------------------------------------------------------------------------
