@@ -174,7 +174,6 @@ def _create_conversation_no_azure() -> str:
                     params={
                         "skip_embedding": "true",
                         "ocr_provider": "anthropic",
-                        "skip_ocr_cache": "true",
                     },
                 )
                 resp.raise_for_status()
