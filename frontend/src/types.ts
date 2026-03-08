@@ -39,6 +39,17 @@ export interface Document {
 	uploaded_at: string;
 }
 
+export interface ReportSection {
+	id: string;
+	title: string;
+	description: string;
+}
+
+export interface SectionsProposal {
+	sections: ReportSection[];
+	docSummary: string;
+}
+
 export interface ConversationDetail extends Conversation {
 	document?: Document;
 	documents: Document[];

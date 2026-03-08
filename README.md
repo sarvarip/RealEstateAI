@@ -2,7 +2,7 @@
 
 An AI-powered document assistant for commercial real estate lawyers. Upload legal document bundles (leases, deeds, rent review memoranda) and ask questions that require cross-referencing information across multiple documents. Every answer is grounded with clickable, verified citations that navigate directly to the source page and highlight the exact quoted text.
 
-Built with FastAPI, React, PostgreSQL + pgvector, PydanticAI (Claude Opus 4.5), and Azure/Anthropic OCR.
+Built with FastAPI, React, PostgreSQL + pgvector, PydanticAI (Claude Opus 4.6), and Azure/Anthropic OCR.
 
 ---
 
@@ -23,9 +23,9 @@ The threshold is configurable and the switch is transparent — the same questio
 
 A lawyer can't trust an AI answer they can't verify. The citation system ensures every factual claim is traceable to an exact location in the source documents.
 
-**Structured output architecture:**
+**Agentic architecture with structured outputs:**
 
-Rather than parsing citations from free-text LLM output (which proved fragile — see `APPROACH.md`), the system uses PydanticAI structured outputs. The LLM returns a `StructuredAnswer` containing a list of `AnswerSegment` objects, each with its own `text` and `citations` list. Each citation carries `{filename, page, quote}`. This eliminates regex parsing entirely — the segment-citation pairing is guaranteed by construction.
+The system uses PydanticAI agents with `search_documents` and `get_page` tools. The agent autonomously decides how to research a question — searching for relevant chunks, reading specific pages to verify quotes, and cross-referencing across documents. Answers are returned as `StructuredAnswer` objects containing `AnswerSegment` objects, each with its own `text` and `citations` list. Each citation carries `{filename, page, quote}`. This eliminates regex parsing entirely — the segment-citation pairing is guaranteed by construction.
 
 **Two-pass quote verification:**
 
@@ -56,6 +56,24 @@ Many legal PDFs are scanned images with no text layer. The system handles these 
 
 **Graceful degradation:** The app works with just an Anthropic API key — no Azure required. Without Azure, you lose embeddings (RAG falls back to full-context) and premium OCR (Anthropic vision handles scanned pages instead). This is useful for development and for environments with limited API access.
 
+### Structured Report Generation (Extension)
+
+The system can generate structured reports (e.g., Report on Title) through a multi-agent pipeline:
+
+**Phase 1 — Proposal (automatic):**
+1. **Summary agent** reads the first 1-3 pages of each document to understand the bundle
+2. **Planning agent** (no tools, structured output) proposes 5-10 sections with search queries
+3. **Programmatic search** executes exactly one RAG query per section — bounded, deterministic
+4. Frontend displays an interactive checklist of proposed sections with preliminary citations
+
+**Phase 2 — Execution (user-confirmed):**
+1. User selects which sections to expand
+2. Parallel **section agents** (each with search + page-read tools) write ~300 words per section
+3. All citations verified via the same two-pass pipeline
+4. Combined report returned with section headers and inline citations
+
+**Agent execution control:** The main agent's execution loop uses `Agent.iter()` (not `Agent.run()`), allowing immediate programmatic termination after the report tool completes — preventing wasted tokens from post-completion tool calls.
+
 ---
 
 ## Architecture
@@ -64,29 +82,34 @@ Many legal PDFs are scanned images with no text layer. The system handles these 
 Frontend (React + Vite)         Backend (FastAPI)              Storage
 ┌─────────────────────┐   SSE   ┌──────────────────────┐   ┌───────────────┐
 │ Chat UI             │◄───────►│ Messages Router      │   │ PostgreSQL 16 │
-│ PDF Viewer          │         │  ├─ build_context()  │──►│  messages     │
-│ Citation Chips      │         │  ├─ answer_with_cites()│ │  documents    │
-│ Text Highlighting   │         │  └─ verify_citations()│  │  chunks       │
-└─────────────────────┘         ├──────────────────────┤   │  (pgvector)   │
-                                │ Document Router      │   └───────────────┘
-                                │  ├─ extract_pages()  │
-                                │  ├─ ocr_pages()      │   ┌───────────────┐
-                                │  ├─ chunk_document() │──►│ Azure OpenAI  │
-                                │  └─ embed_texts()    │   │ (embeddings)  │
+│ PDF Viewer          │         │  ├─ SSE streaming    │──►│  messages     │
+│ Citation Chips      │         │  └─ Phase 2 dispatch │   │  documents    │
+│ Text Highlighting   │         ├──────────────────────┤   │  chunks       │
+│ Section Checklist   │         │ Main Agent (Opus 4.6)│   │  (pgvector)   │
+└─────────────────────┘         │  ├─ search_documents │   └───────────────┘
+                                │  ├─ get_page         │
+                                │  └─ generate_report  │   ┌───────────────┐
+                                ├──────────────────────┤──►│ Azure OpenAI  │
+                                │ Report Pipeline      │   │ (embeddings)  │
+                                │  ├─ Summary Agent    │   └───────────────┘
+                                │  ├─ Planning Agent   │
+                                │  ├─ Programmatic RAG │   ┌───────────────┐
+                                │  └─ Section Agents   │──►│ Anthropic API │
                                 ├──────────────────────┤   └───────────────┘
-                                │ LLM Service          │
-                                │  ├─ Opus 4.5 (answers)│  ┌───────────────┐
-                                │  └─ Haiku 3.5 (titles,│─►│ Anthropic API │
-                                │     verification,OCR)│   └───────────────┘
+                                │ Document Router      │
+                                │  ├─ extract/OCR/chunk│
+                                │  └─ embed & store    │
                                 └──────────────────────┘
 ```
 
 **Key design decisions:**
 
-- **Opus 4.5 for answer generation**: Higher reasoning quality produces better structured outputs and more accurate citations. The cost is acceptable since answers are generated once per question.
+- **Agentic tool-calling**: PydanticAI `Agent` with `search_documents` and `get_page` tools. The agent autonomously decides when to search, what to read, and how to cross-reference — rather than following a fixed pipeline.
+- **`Agent.iter()` for execution control**: The agent loop is driven by `Agent.iter()` instead of `Agent.run()`, allowing programmatic termination after tool completion (e.g., report generation). This prevents wasted tokens from post-completion tool calls.
+- **Opus 4.6 for answer generation**: Higher reasoning quality produces better structured outputs and more accurate citations. The cost is acceptable since answers are generated once per question.
 - **Haiku 3.5 for auxiliary tasks**: Title generation, secondary citation verification, and vision OCR all use the cheaper, faster Haiku model.
 - **PydanticAI structured outputs**: The `StructuredAnswer` Pydantic model is passed as `output_type` to the Agent, so the LLM is constrained to return valid JSON matching the schema. No regex parsing needed.
-- **Server-Sent Events (SSE)**: The backend streams events (`thinking` → `segments` → `message` → `done`) so the frontend can show a thinking indicator immediately while the LLM processes.
+- **Server-Sent Events (SSE)**: The backend streams events (`status` → `sections_proposal` → `content` → `message` → `done`) so the frontend can show real-time tool execution status and thinking indicators.
 
 ---
 
@@ -97,7 +120,7 @@ Frontend (React + Vite)         Backend (FastAPI)              Storage
 | Frontend | React 18, TypeScript, Vite 6, Tailwind CSS, Radix UI, react-pdf, Streamdown, Framer Motion |
 | Backend | Python 3.12, FastAPI, SQLAlchemy (async), Alembic, PydanticAI, structlog |
 | Database | PostgreSQL 16, pgvector |
-| AI Models | Claude Opus 4.5 (answers), Claude Haiku 3.5 (titles, verification, vision OCR) |
+| AI Models | Claude Opus 4.6 (agents/answers), Claude Haiku 3.5 (titles, verification, vision OCR) |
 | Embeddings | Azure OpenAI `text-embedding-3-large` (3,072 dimensions) |
 | OCR | Azure Document Intelligence / Anthropic Vision (fallback) |
 | Infrastructure | Docker Compose, uv (Python package manager) |
@@ -164,6 +187,8 @@ docker compose exec backend uv run pytest backend/tests/test_real_docs.py -v
 | `TestRAGMode` | 6 | Forced RAG (threshold=1000) — same questions, verifies RAG retrieves correct chunks |
 | `TestNoAzureKeys` | 4 | Anthropic-only pipeline — OCR via vision, full-context mode, citations still work |
 | `TestSecondaryVerification` | 2 | Unit test — paraphrased quote fails primary check, secondary LLM corrects it |
+| `TestReportProposal` | 5 | Phase 1 report: summary + planning + programmatic search, section proposal |
+| `TestReportExecution` | 3 | Phase 2 report: select 2 sections, parallel agent generation, citations |
 
 Tests use per-question response caching to avoid redundant LLM calls within a test module, and retry logic for transient API errors.
 

@@ -19,6 +19,7 @@ from takehome.services.document import get_documents_for_conversation
 from takehome.services.llm import (
     StructuredResult,
     answer_with_citations,
+    execute_report_sections,
     generate_title,
 )
 
@@ -61,6 +62,8 @@ class MessageOut(BaseModel):
 
 class MessageCreate(BaseModel):
     content: str
+    report_sections: list[dict[str, str]] | None = None
+    doc_summary: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +177,8 @@ async def send_message(
     user_msg_count = sum(1 for m in history_messages if m.role == "user")
     is_first_message = user_msg_count == 0
 
+    is_report_execution = bool(body.report_sections)
+
     async def event_stream() -> AsyncIterator[str]:
         """Generate SSE events with tool-use status and the structured LLM response."""
 
@@ -186,15 +191,25 @@ async def send_message(
 
         async def run_agent() -> StructuredResult | None:
             try:
-                return await answer_with_citations(
-                    user_message=body.content,
-                    session=session,
-                    conversation_id=conversation_id,
-                    conversation_history=conversation_history,
-                    documents=documents,
-                    rag_threshold_override=rag_threshold,
-                    on_tool_call=on_tool_call,
-                )
+                if is_report_execution:
+                    return await execute_report_sections(
+                        sections=body.report_sections or [],
+                        doc_summary=body.doc_summary or "",
+                        session=session,
+                        conversation_id=conversation_id,
+                        documents=documents,
+                        on_tool_call=on_tool_call,
+                    )
+                else:
+                    return await answer_with_citations(
+                        user_message=body.content,
+                        session=session,
+                        conversation_id=conversation_id,
+                        conversation_history=conversation_history,
+                        documents=documents,
+                        rag_threshold_override=rag_threshold,
+                        on_tool_call=on_tool_call,
+                    )
             except Exception:
                 logger.exception("Error during LLM call", conversation_id=conversation_id)
                 return None
@@ -237,6 +252,12 @@ async def send_message(
                 citations_json=citations_json,
             )
             save_session.add(assistant_message)
+
+            # Touch the conversation's updated_at so the sidebar sorts correctly
+            conv = await get_conversation(save_session, conversation_id)
+            if conv is not None:
+                conv.updated_at = datetime.utcnow()
+
             await save_session.commit()
             await save_session.refresh(assistant_message)
 
@@ -277,6 +298,13 @@ async def send_message(
                     "created_at": assistant_message.created_at.isoformat(),
                 },
             })
+
+            if structured.proposed_sections and not is_report_execution:
+                yield _sse({
+                    "type": "sections_proposal",
+                    "sections": structured.proposed_sections,
+                    "doc_summary": structured.doc_summary or "",
+                })
 
             yield _sse({
                 "type": "done",

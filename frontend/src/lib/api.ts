@@ -56,11 +56,20 @@ export async function fetchMessages(
 export async function sendMessage(
 	conversationId: string,
 	content: string,
+	opts?: {
+		reportSections?: Array<{ id: string; title: string; description: string }>;
+		docSummary?: string;
+	},
 ): Promise<Response> {
+	const payload: Record<string, unknown> = { content };
+	if (opts?.reportSections) {
+		payload.report_sections = opts.reportSections;
+		payload.doc_summary = opts.docSummary ?? "";
+	}
 	const res = await fetch(`${BASE}/conversations/${conversationId}/messages`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ content }),
+		body: JSON.stringify(payload),
 	});
 	if (!res.ok) {
 		const text = await res.text().catch(() => "Unknown error");

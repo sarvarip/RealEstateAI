@@ -62,12 +62,27 @@ def _ask_question_full(
     question: str,
     rag_threshold: int | None = None,
     retries: int = 2,
+    timeout: int = 300,
 ) -> dict:
     """Send a question and return the full message event (with segments, citations, etc.).
 
     Retries on transient failures (missing 'message' event typically means
     the upstream LLM had a connection error).
     """
+    msg, _ = _ask_question_with_events(
+        conv_id, question, rag_threshold=rag_threshold, retries=retries, timeout=timeout,
+    )
+    return msg
+
+
+def _ask_question_with_events(
+    conv_id: str,
+    question: str,
+    rag_threshold: int | None = None,
+    retries: int = 2,
+    timeout: int = 300,
+) -> tuple[dict, list[dict]]:
+    """Send a question and return (message_event, all_sse_events)."""
     import time
 
     params = {}
@@ -79,7 +94,7 @@ def _ask_question_full(
         if attempt > 0:
             time.sleep(5 * attempt)
 
-        with httpx.Client(base_url=BASE_URL, timeout=300) as client:
+        with httpx.Client(base_url=BASE_URL, timeout=timeout) as client:
             resp = client.post(
                 f"/api/conversations/{conv_id}/messages",
                 json={"content": question},
@@ -89,7 +104,7 @@ def _ask_question_full(
             events = _parse_sse_events(resp)
             for event in events:
                 if event.get("type") == "message":
-                    return event["message"]
+                    return event["message"], events
 
         last_error = AssertionError(
             f"No 'message' event in SSE response (attempt {attempt + 1}). "
@@ -186,6 +201,40 @@ def _create_conversation_no_azure() -> str:
     return conv_id
 
 
+SYNTHETIC_DOCS_DIR = Path("/app/synthetic-docs") if Path("/app/synthetic-docs").exists() else Path("synthetic-docs")
+
+SYNTHETIC_DOC_FILES = [
+    "commercial-lease-100-bishopsgate.pdf",
+    "title-report-lot-7.pdf",
+]
+
+
+def _create_synthetic_conversation() -> str:
+    """Create a conversation with synthetic (text-based) docs — fast, no OCR needed."""
+    with httpx.Client(base_url=BASE_URL, timeout=120) as client:
+        resp = client.post("/api/conversations", json={})
+        resp.raise_for_status()
+        conv_id = resp.json()["id"]
+
+        for filename in SYNTHETIC_DOC_FILES:
+            filepath = SYNTHETIC_DOCS_DIR / filename
+            if not filepath.exists():
+                pytest.skip(f"Synthetic doc not found: {filepath}")
+            with open(filepath, "rb") as f:
+                resp = client.post(
+                    f"/api/conversations/{conv_id}/documents",
+                    files={"file": (filename, f, "application/pdf")},
+                )
+                resp.raise_for_status()
+
+        docs_resp = client.get(f"/api/conversations/{conv_id}/documents")
+        docs_resp.raise_for_status()
+        docs = docs_resp.json()
+        assert len(docs) == 2, f"Expected 2 synthetic documents, got {len(docs)}"
+
+    return conv_id
+
+
 RENT_MEMO_FILE = "Rent review memorandum - 8th Fl, Building 5, New Street Sq.pdf"
 
 
@@ -222,6 +271,11 @@ def rag_conversation() -> str:
 @pytest.fixture(scope="module")
 def no_azure_conversation() -> str:
     return _create_conversation_no_azure()
+
+
+@pytest.fixture(scope="module")
+def synthetic_conversation() -> str:
+    return _create_synthetic_conversation()
 
 
 @pytest.fixture(scope="module")
@@ -267,6 +321,68 @@ def _get_structured(conv_id: str) -> dict:
             "What is the current rent and who are the current parties (landlord and tenant)?",
         )
     return _cache_structured
+
+
+_cache_proposal: tuple[dict, list[dict]] | None = None
+_cache_report: tuple[dict, list[dict]] | None = None
+
+
+def _get_proposal(conv_id: str) -> tuple[dict, list[dict]]:
+    """Phase 1: get the report proposal (summary + planning + programmatic search)."""
+    global _cache_proposal
+    if _cache_proposal is None:
+        _cache_proposal = _ask_question_with_events(
+            conv_id,
+            "Please provide a comprehensive written analysis of these documents "
+            "covering the key legal and commercial terms.",
+            rag_threshold=1000,
+            timeout=180,
+        )
+    return _cache_proposal
+
+
+def _get_report(conv_id: str) -> tuple[dict, list[dict]]:
+    """Phase 2: execute first 2 proposed sections to generate actual report content."""
+    global _cache_report
+    if _cache_report is not None:
+        return _cache_report
+
+    _, proposal_events = _get_proposal(conv_id)
+
+    proposal_event = next(
+        (e for e in proposal_events if e.get("type") == "sections_proposal"),
+        None,
+    )
+    assert proposal_event is not None, (
+        f"No sections_proposal SSE event found. Events: {[e.get('type') for e in proposal_events]}"
+    )
+
+    sections = proposal_event.get("sections", [])
+    doc_summary = proposal_event.get("doc_summary", "")
+    assert len(sections) >= 2, f"Expected at least 2 proposed sections, got {len(sections)}"
+
+    selected = sections[:2]
+
+    with httpx.Client(base_url=BASE_URL, timeout=300) as client:
+        resp = client.post(
+            f"/api/conversations/{conv_id}/messages",
+            json={
+                "content": "Generate report",
+                "report_sections": selected,
+                "doc_summary": doc_summary,
+            },
+            params={"rag_threshold": 1000},
+        )
+        resp.raise_for_status()
+        events = _parse_sse_events(resp)
+        for event in events:
+            if event.get("type") == "message":
+                _cache_report = (event["message"], events)
+                return _cache_report
+
+    raise AssertionError(
+        f"No 'message' event in Phase 2 SSE. Events: {[e.get('type') for e in events]}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -560,3 +676,113 @@ class TestSecondaryVerification:
             "Hallucinated quote should remain UNVERIFIED after both passes — "
             "this would display as an amber warning chip in the frontend"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Report generation — agent uses generate_comprehensive_report + search tools
+# Uses synthetic docs (text-based PDFs) for speed.
+# ──────────────────────────────────────────────────────────────────────────────
+
+REPORT_SECTIONS = [
+    "property",
+    "parties",
+    "rent",
+    "break",
+]
+
+
+class TestReportProposal:
+    """Phase 1: agent calls generate_comprehensive_report and returns a proposal.
+
+    Uses synthetic docs (text-based PDFs) for speed. Only tests the proposal
+    (summary + planning + programmatic search), not the full section execution.
+    """
+
+    def test_agent_called_report_guidelines(self, synthetic_conversation: str) -> None:
+        """The agent should autonomously call generate_comprehensive_report."""
+        _, events = _get_proposal(synthetic_conversation)
+        planning_events = [
+            e for e in events
+            if e.get("type") == "status" and e.get("status") == "planning"
+        ]
+        assert len(planning_events) >= 1, (
+            f"Expected at least one 'planning' SSE event, "
+            f"got events: {[e.get('status') for e in events if e.get('type') == 'status']}"
+        )
+
+    def test_agent_used_search_tools(self, synthetic_conversation: str) -> None:
+        """Programmatic search should fire search events during proposal."""
+        _, events = _get_proposal(synthetic_conversation)
+        search_events = [
+            e for e in events
+            if e.get("type") == "status" and e.get("status") == "searching"
+        ]
+        assert len(search_events) >= 2, (
+            f"Expected at least 2 search events, got {len(search_events)}"
+        )
+
+    def test_proposal_has_sections(self, synthetic_conversation: str) -> None:
+        """Proposal SSE should contain at least 3 proposed sections."""
+        _, events = _get_proposal(synthetic_conversation)
+        proposal = next(
+            (e for e in events if e.get("type") == "sections_proposal"), None
+        )
+        assert proposal is not None, "No sections_proposal event in SSE"
+        sections = proposal.get("sections", [])
+        assert len(sections) >= 3, (
+            f"Expected >=3 proposed sections, got {len(sections)}"
+        )
+
+    def test_proposal_has_doc_summary(self, synthetic_conversation: str) -> None:
+        """Proposal should carry the doc_summary for Phase 2."""
+        _, events = _get_proposal(synthetic_conversation)
+        proposal = next(
+            (e for e in events if e.get("type") == "sections_proposal"), None
+        )
+        assert proposal is not None, "No sections_proposal event in SSE"
+        doc_summary = proposal.get("doc_summary", "")
+        assert len(doc_summary) > 20, (
+            f"Expected a non-trivial doc_summary, got: {doc_summary!r}"
+        )
+
+    def test_proposal_section_headers(self, synthetic_conversation: str) -> None:
+        """Proposal message should contain section headers."""
+        msg, _ = _get_proposal(synthetic_conversation)
+        all_text = " ".join(seg["text"] for seg in msg.get("segments", [])).lower()
+        found = [s for s in REPORT_SECTIONS if s in all_text]
+        assert len(found) >= 2, (
+            f"Expected at least 2 of {REPORT_SECTIONS} in proposal, found: {found}"
+        )
+
+
+class TestReportExecution:
+    """Phase 2: selecting sections and executing the report.
+
+    Selects first 2 sections from the proposal, runs them in parallel,
+    and validates the generated report content.
+    """
+
+    def test_report_has_segments(self, synthetic_conversation: str) -> None:
+        """Phase 2 should produce multiple segments (3-5 per section, so >=4 total)."""
+        msg, _ = _get_report(synthetic_conversation)
+        segments = msg.get("segments", [])
+        assert len(segments) >= 4, (
+            f"Expected at least 4 segments for 2 sections, got {len(segments)}"
+        )
+
+    def test_report_has_citations(self, synthetic_conversation: str) -> None:
+        """Phase 2 should have citations grounded in source documents."""
+        msg, _ = _get_report(synthetic_conversation)
+        _assert_has_segments_and_citations(msg, "Report")
+        cites = _all_citations(msg)
+        assert len(cites) >= 2, (
+            f"Expected at least 2 citations in report, got {len(cites)}"
+        )
+
+    def test_report_mentions_key_facts(self, synthetic_conversation: str) -> None:
+        """Report should include key facts from the Bishopsgate lease."""
+        msg, _ = _get_report(synthetic_conversation)
+        lower = msg["content"].lower()
+        assert any(
+            t in lower for t in ["bishopsgate", "100 bishopsgate", "850,000", "850000", "£850", "meridian"]
+        ), f"Expected at least one key fact in report:\n{msg['content'][:500]}"

@@ -24,7 +24,10 @@ export default function App() {
 		loading: messagesLoading,
 		error: messagesError,
 		thinking,
+		toolStatus,
+		proposal,
 		send,
+		executeReport,
 	} = useMessages(selectedId);
 
 	const {
@@ -100,17 +103,20 @@ export default function App() {
 					onDelete={remove}
 				/>
 
-			<ChatWindow
-				messages={messages}
-				loading={messagesLoading}
-				error={messagesError}
-				thinking={thinking}
-				hasDocument={documents.length > 0}
-				conversationId={selectedId}
-				onSend={handleSend}
-				onUpload={handleUpload}
-				onCitationClick={handleCitationClick}
-			/>
+		<ChatWindow
+			messages={messages}
+			loading={messagesLoading}
+			error={messagesError}
+			thinking={thinking}
+			toolStatus={toolStatus}
+			proposal={proposal}
+			hasDocument={documents.length > 0}
+			conversationId={selectedId}
+			onSend={handleSend}
+			onUpload={handleUpload}
+			onCitationClick={handleCitationClick}
+			onExecuteReport={executeReport}
+		/>
 
 				<DocumentViewer
 					document={document}
