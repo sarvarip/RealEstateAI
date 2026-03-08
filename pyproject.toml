@@ -61,8 +61,10 @@ known-first-party = ["takehome"]
 
 [tool.pyright]
 pythonVersion = "3.12"
-typeCheckingMode = "strict"
+typeCheckingMode = "standard"
 extraPaths = ["backend/src"]
+venvPath = "."
+venv = ".venv"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

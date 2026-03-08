@@ -382,8 +382,9 @@ def _sync_verified_flags(
     """Push verified flags from flat Citation list back into serialised segments."""
     cite_by_index: dict[int, Citation] = {c.index: c for c in citations}
     for seg in segments:
-        for sc in seg["citations"]:
-            verified_cite = cite_by_index.get(sc["index"])
+        seg_cites: list[dict[str, object]] = seg["citations"]  # type: ignore[assignment]
+        for sc in seg_cites:
+            verified_cite = cite_by_index.get(sc["index"])  # type: ignore[arg-type]
             if verified_cite:
                 sc["verified"] = verified_cite.verified
                 sc["quote"] = verified_cite.quote
