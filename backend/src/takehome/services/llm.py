@@ -72,16 +72,9 @@ class AgentDeps:
 # Agentic agent with tools
 # ---------------------------------------------------------------------------
 
-_AGENTIC_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT = (
     "You are a helpful legal document assistant for commercial real estate lawyers. "
     "You help lawyers review and understand documents during due diligence.\n\n"
-    "RETRIEVAL STRATEGY:\n"
-    "- If full document text is provided in the user message, answer from it directly.\n"
-    "- If only a document list is provided (no full text), you MUST use search_documents() "
-    "to find relevant content before answering. You may call it multiple times with "
-    "different queries to gather all the information you need.\n"
-    "- Use get_page() to read the full text of a specific page — especially to verify "
-    "exact quote wording before citing.\n\n"
     "ANSWER FORMAT:\n"
     "- Answer questions based ONLY on the document content provided or retrieved.\n"
     "- Break your answer into logical segments. Each segment should be one or two "
@@ -105,7 +98,7 @@ agentic_agent = Agent(
     "anthropic:claude-opus-4-5-20251101",
     deps_type=AgentDeps,
     output_type=StructuredAnswer,
-    instructions=_AGENTIC_SYSTEM_PROMPT,
+    instructions=_SYSTEM_PROMPT,
     retries=2,
 )
 
@@ -333,7 +326,10 @@ async def answer_with_citations(
             full_text = _build_full_text(documents)
             user_prompt = (
                 f"You have {len(documents)} document(s):\n{doc_list}\n\n"
-                f"Full document text follows:\n\n{full_text}\n\n"
+                f"Full document text follows. Answer from this text. "
+                f"You may use get_page() to verify exact quote wording "
+                f"on a specific page before citing.\n\n"
+                f"{full_text}\n\n"
                 f"Question: {user_message}"
             )
             mode = "full"
@@ -345,8 +341,10 @@ async def answer_with_citations(
         else:
             user_prompt = (
                 f"You have {len(documents)} document(s):\n{doc_list}\n\n"
-                "Full document text is NOT provided — use search_documents() to find "
-                "relevant content and get_page() to read specific pages.\n\n"
+                "Use search_documents() to find relevant content — you may call it "
+                "multiple times with different queries to gather all the information "
+                "you need. Use get_page() to read the full text of a specific page "
+                "and verify exact quote wording before citing.\n\n"
                 f"Question: {user_message}"
             )
             mode = "agentic"
