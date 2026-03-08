@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -16,8 +17,8 @@ from takehome.db.session import get_session
 from takehome.services.conversation import get_conversation, update_conversation
 from takehome.services.document import get_documents_for_conversation
 from takehome.services.llm import (
+    StructuredResult,
     answer_with_citations,
-    build_document_context,
     generate_title,
 )
 
@@ -157,14 +158,6 @@ async def send_message(
 
     documents = await get_documents_for_conversation(session, conversation_id)
 
-    doc_context = await build_document_context(
-        session=session,
-        conversation_id=conversation_id,
-        user_message=body.content,
-        documents=documents,
-        rag_threshold_override=rag_threshold,
-    )
-
     stmt = (
         select(Message)
         .where(Message.conversation_id == conversation_id)
@@ -182,25 +175,45 @@ async def send_message(
     is_first_message = user_msg_count == 0
 
     async def event_stream() -> AsyncIterator[str]:
-        """Generate SSE events with the structured LLM response."""
+        """Generate SSE events with tool-use status and the structured LLM response."""
 
-        # Tell the frontend we're working on it
         yield _sse({"type": "status", "status": "thinking"})
 
-        try:
-            structured = await answer_with_citations(
-                user_message=body.content,
-                context=doc_context,
-                conversation_history=conversation_history,
-                documents=documents,
-            )
-        except Exception:
-            logger.exception("Error during LLM call", conversation_id=conversation_id)
-            error_msg = "I'm sorry, an error occurred while generating a response. Please try again."
-            yield _sse({"type": "content", "content": error_msg})
-            structured = None
+        tool_events: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
+
+        async def on_tool_call(status: str, details: dict[str, object]) -> None:
+            await tool_events.put({"type": "status", "status": status, **details})
+
+        async def run_agent() -> StructuredResult | None:
+            try:
+                return await answer_with_citations(
+                    user_message=body.content,
+                    session=session,
+                    conversation_id=conversation_id,
+                    conversation_history=conversation_history,
+                    documents=documents,
+                    rag_threshold_override=rag_threshold,
+                    on_tool_call=on_tool_call,
+                )
+            except Exception:
+                logger.exception("Error during LLM call", conversation_id=conversation_id)
+                return None
+            finally:
+                await tool_events.put(None)
+
+        task = asyncio.create_task(run_agent())
+
+        while True:
+            event = await tool_events.get()
+            if event is None:
+                break
+            yield _sse(event)
+
+        structured = task.result()
 
         if structured is None:
+            error_msg = "I'm sorry, an error occurred while generating a response. Please try again."
+            yield _sse({"type": "content", "content": error_msg})
             yield _sse({"type": "done", "sources_cited": 0})
             return
 
@@ -211,7 +224,6 @@ async def send_message(
             "segments": structured.segments,
         })
 
-        # Emit segments for immediate rendering
         yield _sse({"type": "segments", "segments": structured.segments})
 
         from takehome.db.session import async_session as session_factory
@@ -283,6 +295,6 @@ async def send_message(
     )
 
 
-def _sse(data: dict) -> str:
+def _sse(data: dict[str, object]) -> str:
     """Format a dict as an SSE data line."""
     return f"data: {json.dumps(data)}\n\n"

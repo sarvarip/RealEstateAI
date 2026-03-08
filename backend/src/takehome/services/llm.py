@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 import structlog
 from pydantic import BaseModel
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -14,7 +15,7 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
-from sqlalchemy import text
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from takehome.config import settings  # noqa: F401 — triggers ANTHROPIC_API_KEY export
@@ -51,14 +52,38 @@ class StructuredAnswer(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Agents
+# Agent dependencies
 # ---------------------------------------------------------------------------
 
-_STRUCTURED_SYSTEM_PROMPT = (
+ToolCallbackT = Callable[[str, dict[str, object]], Awaitable[None]]
+
+
+@dataclass
+class AgentDeps:
+    """Runtime dependencies injected into agent tool calls."""
+
+    session: AsyncSession
+    conversation_id: str
+    documents: list[Document]
+    on_tool_call: ToolCallbackT | None = None
+
+
+# ---------------------------------------------------------------------------
+# Agentic agent with tools
+# ---------------------------------------------------------------------------
+
+_AGENTIC_SYSTEM_PROMPT = (
     "You are a helpful legal document assistant for commercial real estate lawyers. "
     "You help lawyers review and understand documents during due diligence.\n\n"
-    "IMPORTANT INSTRUCTIONS:\n"
-    "- Answer questions based ONLY on the document content provided.\n"
+    "RETRIEVAL STRATEGY:\n"
+    "- If full document text is provided in the user message, answer from it directly.\n"
+    "- If only a document list is provided (no full text), you MUST use search_documents() "
+    "to find relevant content before answering. You may call it multiple times with "
+    "different queries to gather all the information you need.\n"
+    "- Use get_page() to read the full text of a specific page — especially to verify "
+    "exact quote wording before citing.\n\n"
+    "ANSWER FORMAT:\n"
+    "- Answer questions based ONLY on the document content provided or retrieved.\n"
     "- Break your answer into logical segments. Each segment should be one or two "
     "sentences covering a single factual point.\n"
     "- For every segment that makes a factual claim, provide at least one citation.\n"
@@ -74,111 +99,40 @@ _STRUCTURED_SYSTEM_PROMPT = (
     "and note any discrepancies."
 )
 
-structured_agent = Agent(
+SEARCH_TOP_K = 10
+
+agentic_agent = Agent(
     "anthropic:claude-opus-4-5-20251101",
+    deps_type=AgentDeps,
     output_type=StructuredAnswer,
-    instructions=_STRUCTURED_SYSTEM_PROMPT,
+    instructions=_AGENTIC_SYSTEM_PROMPT,
     retries=2,
 )
 
-_title_agent = Agent(
-    "anthropic:claude-haiku-4-5-20251001",
-    instructions="Generate a concise 3-5 word title. Return only the title, nothing else.",
-)
 
-# ---------------------------------------------------------------------------
-# Retrieval context (unchanged)
-# ---------------------------------------------------------------------------
+@agentic_agent.tool
+async def search_documents(ctx: RunContext[AgentDeps], query: str) -> str:
+    """Semantic search across all conversation documents. Returns the most relevant chunks.
 
+    Call this to find content related to a specific topic. You may call it
+    multiple times with different queries to gather all the information needed.
 
-@dataclass
-class RetrievalContext:
-    """The document context assembled for the LLM prompt."""
-
-    text: str
-    mode: str  # "full" or "rag"
-    chunk_count: int
-    doc_count: int
-
-
-async def build_document_context(
-    session: AsyncSession,
-    conversation_id: str,
-    user_message: str,
-    documents: list[Document],
-    rag_threshold_override: int | None = None,
-) -> RetrievalContext:
-    """Build the document context for the LLM, using full-context or RAG as appropriate."""
-    if not documents:
-        return RetrievalContext(
-            text="No documents have been uploaded yet. If the user asks about a document, "
-            "let them know they need to upload one first.",
-            mode="none",
-            chunk_count=0,
-            doc_count=0,
-        )
-
-    threshold = rag_threshold_override if rag_threshold_override is not None else settings.rag_token_threshold
-    total_text = "\n\n".join(d.extracted_text or "" for d in documents)
-    total_tokens = estimate_tokens(total_text)
-
-    logger.info("Token estimate", total_tokens=total_tokens, threshold=threshold)
+    Args:
+        query: A natural-language search query (e.g. "current annual rent").
+    """
+    if ctx.deps.on_tool_call:
+        await ctx.deps.on_tool_call("searching", {"query": query})
 
     if not settings.embeddings_enabled:
-        if total_tokens >= threshold:
-            logger.warning(
-                "Embeddings disabled but token count exceeds threshold — "
-                "using full-context anyway",
-                total_tokens=total_tokens,
-                threshold=threshold,
-            )
-        return _build_full_context(documents)
+        return "Embeddings are not available. Use the full document text provided above."
 
-    if total_tokens < threshold:
-        return _build_full_context(documents)
+    try:
+        query_embedding = embed_query(query)
+    except RuntimeError:
+        return "Embeddings are not available. Use the full document text provided above."
 
-    return await _build_rag_context(session, conversation_id, user_message)
-
-
-def _build_full_context(documents: list[Document]) -> RetrievalContext:
-    """Full-context mode: include all document text with clear labels."""
-    parts: list[str] = []
-    total_chunks = 0
-
-    for doc in documents:
-        if doc.extracted_text:
-            parts.append(
-                f"<document filename=\"{doc.filename}\">\n"
-                f"{doc.extracted_text}\n"
-                f"</document>"
-            )
-            total_chunks += 1
-
-    logger.info(
-        "Using full-context mode",
-        doc_count=len(documents),
-        total_chars=sum(len(d.extracted_text or "") for d in documents),
-    )
-
-    return RetrievalContext(
-        text="\n\n".join(parts),
-        mode="full",
-        chunk_count=total_chunks,
-        doc_count=len(documents),
-    )
-
-
-async def _build_rag_context(
-    session: AsyncSession,
-    conversation_id: str,
-    user_message: str,
-) -> RetrievalContext:
-    """RAG mode: embed query, retrieve top-K relevant chunks via pgvector."""
-    query_embedding = embed_query(user_message)
-
-    stmt = text("""
-        SELECT dc.id, dc.content, dc.page_number, dc.chunk_index,
-               d.filename, d.id as document_id,
+    stmt = sa_text("""
+        SELECT dc.content, dc.page_number, d.filename,
                dc.embedding <=> :query_embedding AS distance
         FROM document_chunks dc
         JOIN documents d ON dc.document_id = d.id
@@ -188,55 +142,75 @@ async def _build_rag_context(
         LIMIT :top_k
     """)
 
-    result = await session.execute(
+    result = await ctx.deps.session.execute(
         stmt,
         {
             "query_embedding": str(query_embedding),
-            "conversation_id": conversation_id,
-            "top_k": settings.rag_top_k,
+            "conversation_id": ctx.deps.conversation_id,
+            "top_k": SEARCH_TOP_K,
         },
     )
     rows = result.fetchall()
 
     if not rows:
-        return RetrievalContext(
-            text="Documents were uploaded but no searchable content was found.",
-            mode="rag",
-            chunk_count=0,
-            doc_count=0,
-        )
+        return "No matching content found. Try a different query."
 
     parts: list[str] = []
-    doc_names: set[str] = set()
     for row in rows:
-        filename = row.filename
-        page = row.page_number
-        content = row.content
-        doc_names.add(filename)
+        score = round(1 - row.distance, 3)
         parts.append(
-            f"<chunk filename=\"{filename}\" page=\"{page}\">\n"
-            f"{content}\n"
+            f'<chunk filename="{row.filename}" page="{row.page_number}" score="{score}">\n'
+            f"{row.content}\n"
             f"</chunk>"
         )
 
     logger.info(
-        "Using RAG mode",
-        chunks_retrieved=len(rows),
-        doc_count=len(doc_names),
-        top_distance=round(rows[0].distance, 4) if rows else None,
+        "search_documents tool called",
+        query=query,
+        chunks_returned=len(rows),
+        top_score=round(1 - rows[0].distance, 3),
     )
 
-    return RetrievalContext(
-        text="\n\n".join(parts),
-        mode="rag",
-        chunk_count=len(rows),
-        doc_count=len(doc_names),
-    )
+    return "\n\n".join(parts)
+
+
+@agentic_agent.tool
+async def get_page(ctx: RunContext[AgentDeps], filename: str, page: int) -> str:
+    """Get the full text of a specific page from a document.
+
+    Use this to read the complete page context — especially to verify exact
+    quote wording before citing. Chunks from search_documents are excerpts;
+    this returns the entire page.
+
+    Args:
+        filename: The document filename (as shown in the document list).
+        page: The 1-based page number.
+    """
+    if ctx.deps.on_tool_call:
+        await ctx.deps.on_tool_call("reading", {"filename": filename, "page": page})
+
+    doc_map = _build_doc_map(ctx.deps.documents)
+    doc = doc_map.get(filename.lower())
+    if not doc:
+        return f"Document '{filename}' not found."
+
+    page_text = _get_page_text(doc, page)
+    if not page_text:
+        return f"Page {page} not found in '{filename}'."
+
+    logger.info("get_page tool called", filename=filename, page=page)
+
+    return f'<page filename="{doc.filename}" page="{page}">\n{page_text.strip()}\n</page>'
 
 
 # ---------------------------------------------------------------------------
 # Title generation (uses cheap Haiku)
 # ---------------------------------------------------------------------------
+
+_title_agent = Agent(
+    "anthropic:claude-haiku-4-5-20251001",
+    instructions="Generate a concise 3-5 word title. Return only the title, nothing else.",
+)
 
 
 async def generate_title(user_message: str) -> str:
@@ -252,7 +226,7 @@ async def generate_title(user_message: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core Q&A — single structured-output call
+# Core Q&A — agentic structured-output call with tools
 # ---------------------------------------------------------------------------
 
 
@@ -270,7 +244,7 @@ class Citation:
 
 @dataclass
 class StructuredResult:
-    """Complete result from a single structured-output LLM call."""
+    """Complete result from the agentic LLM pipeline."""
 
     content: str
     segments: list[dict[str, object]]
@@ -280,12 +254,7 @@ class StructuredResult:
 def _build_message_history(
     conversation_history: list[dict[str, str]],
 ) -> list[ModelMessage]:
-    """Convert raw conversation history into PydanticAI's native message array.
-
-    This lets the model see proper user/assistant turn boundaries rather than
-    a flattened string, improving multi-turn comprehension and enabling
-    Anthropic prompt caching on the unchanged prefix.
-    """
+    """Convert raw conversation history into PydanticAI's native message array."""
     messages: list[ModelMessage] = []
     for msg in conversation_history:
         if msg["role"] == "user":
@@ -295,31 +264,108 @@ def _build_message_history(
     return messages
 
 
+def _build_document_list(documents: list[Document]) -> str:
+    """Build a human-readable document list with page counts for the prompt."""
+    lines: list[str] = []
+    for doc in documents:
+        lines.append(f"  - {doc.filename} ({doc.page_count or '?'} pages)")
+    return "\n".join(lines)
+
+
+def _build_full_text(documents: list[Document]) -> str:
+    """Build the full document text for full-context mode."""
+    parts: list[str] = []
+    for doc in documents:
+        if doc.extracted_text:
+            parts.append(
+                f'<document filename="{doc.filename}">\n'
+                f"{doc.extracted_text}\n"
+                f"</document>"
+            )
+    return "\n\n".join(parts)
+
+
 async def answer_with_citations(
     user_message: str,
-    context: RetrievalContext,
+    session: AsyncSession,
+    conversation_id: str,
     conversation_history: list[dict[str, str]],
     documents: list[Document],
+    rag_threshold_override: int | None = None,
+    on_tool_call: ToolCallbackT | None = None,
 ) -> StructuredResult:
-    """Answer a question with structured citations in a single LLM call.
+    """Answer a question using the agentic pipeline with search tools.
 
-    Returns a StructuredResult with the plain-text content, serialisable
-    segments (each with text + citations), and a flat list of Citation objects.
+    Determines full-context vs agentic mode based on token threshold.
+    In full-context mode, provides all document text plus tools.
+    In agentic mode, provides only document metadata — the agent uses
+    search_documents() and get_page() to retrieve what it needs.
     """
-    user_prompt = (
-        f"The following is the relevant content from {context.doc_count} document(s) "
-        f"({context.mode} mode, {context.chunk_count} sections):\n\n"
-        f"{context.text}\n\n"
-        f"Question: {user_message}"
+    deps = AgentDeps(
+        session=session,
+        conversation_id=conversation_id,
+        documents=documents,
+        on_tool_call=on_tool_call,
     )
+
+    if not documents:
+        user_prompt = (
+            "No documents have been uploaded yet. If the user asks about a document, "
+            "let them know they need to upload one first.\n\n"
+            f"Question: {user_message}"
+        )
+        mode = "none"
+    else:
+        threshold = (
+            rag_threshold_override
+            if rag_threshold_override is not None
+            else settings.rag_token_threshold
+        )
+        total_text = "\n\n".join(d.extracted_text or "" for d in documents)
+        total_tokens = estimate_tokens(total_text)
+        doc_list = _build_document_list(documents)
+
+        logger.info("Token estimate", total_tokens=total_tokens, threshold=threshold)
+
+        use_full = total_tokens < threshold or not settings.embeddings_enabled
+
+        if use_full:
+            full_text = _build_full_text(documents)
+            user_prompt = (
+                f"You have {len(documents)} document(s):\n{doc_list}\n\n"
+                f"Full document text follows:\n\n{full_text}\n\n"
+                f"Question: {user_message}"
+            )
+            mode = "full"
+            logger.info(
+                "Using full-context mode (tools available)",
+                doc_count=len(documents),
+                total_tokens=total_tokens,
+            )
+        else:
+            user_prompt = (
+                f"You have {len(documents)} document(s):\n{doc_list}\n\n"
+                "Full document text is NOT provided — use search_documents() to find "
+                "relevant content and get_page() to read specific pages.\n\n"
+                f"Question: {user_message}"
+            )
+            mode = "agentic"
+            logger.info(
+                "Using agentic mode (tools required)",
+                doc_count=len(documents),
+                total_tokens=total_tokens,
+            )
 
     message_history = _build_message_history(conversation_history)
 
-    result = await structured_agent.run(
+    result = await agentic_agent.run(
         user_prompt,
+        deps=deps,
         message_history=message_history,
     )
     answer: StructuredAnswer = result.output
+
+    logger.info("Agent completed", mode=mode, segments=len(answer.segments))
 
     doc_map = _build_doc_map(documents)
 
