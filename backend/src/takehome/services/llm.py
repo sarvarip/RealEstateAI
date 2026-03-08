@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 import structlog
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -270,6 +277,24 @@ class StructuredResult:
     citations: list[Citation] = field(default_factory=list)
 
 
+def _build_message_history(
+    conversation_history: list[dict[str, str]],
+) -> list[ModelMessage]:
+    """Convert raw conversation history into PydanticAI's native message array.
+
+    This lets the model see proper user/assistant turn boundaries rather than
+    a flattened string, improving multi-turn comprehension and enabling
+    Anthropic prompt caching on the unchanged prefix.
+    """
+    messages: list[ModelMessage] = []
+    for msg in conversation_history:
+        if msg["role"] == "user":
+            messages.append(ModelRequest(parts=[UserPromptPart(content=msg["content"])]))
+        elif msg["role"] == "assistant":
+            messages.append(ModelResponse(parts=[TextPart(content=msg["content"])]))
+    return messages
+
+
 async def answer_with_citations(
     user_message: str,
     context: RetrievalContext,
@@ -281,30 +306,19 @@ async def answer_with_citations(
     Returns a StructuredResult with the plain-text content, serialisable
     segments (each with text + citations), and a flat list of Citation objects.
     """
-    prompt_parts: list[str] = []
-
-    prompt_parts.append(
+    user_prompt = (
         f"The following is the relevant content from {context.doc_count} document(s) "
         f"({context.mode} mode, {context.chunk_count} sections):\n\n"
-        f"{context.text}\n"
+        f"{context.text}\n\n"
+        f"Question: {user_message}"
     )
 
-    if conversation_history:
-        prompt_parts.append("Previous conversation:\n")
-        for msg in conversation_history:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "user":
-                prompt_parts.append(f"User: {content}\n")
-            elif role == "assistant":
-                prompt_parts.append(f"Assistant: {content}\n")
-        prompt_parts.append("\n")
+    message_history = _build_message_history(conversation_history)
 
-    prompt_parts.append(f"User: {user_message}")
-
-    full_prompt = "\n".join(prompt_parts)
-
-    result = await structured_agent.run(full_prompt)
+    result = await structured_agent.run(
+        user_prompt,
+        message_history=message_history,
+    )
     answer: StructuredAnswer = result.output
 
     doc_map = _build_doc_map(documents)

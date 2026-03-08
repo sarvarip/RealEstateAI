@@ -64,8 +64,8 @@ Many legal PDFs are scanned images with no text layer. The system handles these 
 Frontend (React + Vite)         Backend (FastAPI)              Storage
 ┌─────────────────────┐   SSE   ┌──────────────────────┐   ┌───────────────┐
 │ Chat UI             │◄───────►│ Messages Router      │   │ PostgreSQL 16 │
-│ PDF Viewer          │         │  ├─ build_context()   │──►│  messages     │
-│ Citation Chips      │         │  ├─ answer_with_cites()│  │  documents    │
+│ PDF Viewer          │         │  ├─ build_context()  │──►│  messages     │
+│ Citation Chips      │         │  ├─ answer_with_cites()│ │  documents    │
 │ Text Highlighting   │         │  └─ verify_citations()│  │  chunks       │
 └─────────────────────┘         ├──────────────────────┤   │  (pgvector)   │
                                 │ Document Router      │   └───────────────┘
