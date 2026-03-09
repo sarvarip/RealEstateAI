@@ -27,8 +27,10 @@ async def _extract_pages(
 ) -> list[tuple[int, str]]:
     """Extract per-page text from a PDF, with OCR for pages containing images.
 
-    Returns list of (page_number, text).  For pages with embedded images,
-    OCR text is appended to whatever PyMuPDF extracted from the text layer.
+    Returns list of (page_number, text). PyMuPDF extracts the text layer first.
+    For pages with images, OCR runs and its output *replaces* PyMuPDF text
+    (to avoid duplicate chunks in RAG). PyMuPDF text is kept as fallback only
+    if OCR fails or produces no output for a page.
     """
     pages: list[tuple[int, str]] = []
     image_page_numbers: list[int] = []
@@ -71,11 +73,14 @@ async def _extract_pages(
             ocr_results = {}
 
         if ocr_results:
+            # For pages where OCR succeeded, use OCR text exclusively — it's
+            # more comprehensive than PyMuPDF and avoids duplicate chunks in RAG.
+            # Only fall back to PyMuPDF text if OCR didn't produce output for a page.
             pages = [
-                (pn, _merge_text(text, ocr_results.get(pn, "")))
+                (pn, ocr_results[pn] if pn in ocr_results and ocr_results[pn].strip() else text)
                 for pn, text in pages
             ]
-            logger.info("Merged OCR text", pages_enriched=len(ocr_results))
+            logger.info("Applied OCR text", pages_replaced=len(ocr_results))
     elif image_page_numbers:
         logger.warning(
             "Pages with images detected but no OCR provider available",
@@ -86,19 +91,8 @@ async def _extract_pages(
     return pages
 
 
-def _merge_text(pymupdf_text: str, ocr_text: str) -> str:
-    """Combine PyMuPDF text-layer output with OCR-extracted text.
-
-    If both are present, appends OCR under a separator to avoid duplication
-    issues when the text layer has partial content.
-    """
-    pymupdf_stripped = pymupdf_text.strip()
-    ocr_stripped = ocr_text.strip()
-    if not ocr_stripped:
-        return pymupdf_text
-    if not pymupdf_stripped:
-        return ocr_text
-    return f"{pymupdf_stripped}\n\n--- OCR extracted text ---\n{ocr_stripped}"
+    # _merge_text removed — OCR text now replaces PyMuPDF for pages with images,
+    # avoiding duplicate chunks in RAG. PyMuPDF is kept as fallback if OCR fails.
 
 
 async def upload_document(
