@@ -13,6 +13,7 @@ interface ChatWindowProps {
 	thinking: boolean;
 	toolStatus?: string | null;
 	proposal?: SectionsProposal | null;
+	awaitingResponse?: boolean;
 	hasDocument: boolean;
 	conversationId: string | null;
 	onSend: (content: string) => void;
@@ -28,6 +29,7 @@ export function ChatWindow({
 	thinking,
 	toolStatus,
 	proposal,
+	awaitingResponse,
 	hasDocument,
 	conversationId,
 	onSend,
@@ -91,7 +93,7 @@ export function ChatWindow({
 
 	const lastMessage = messages[messages.length - 1];
 	const needsRetry =
-		!thinking && !loading && lastMessage?.role === "user";
+		!thinking && !loading && !awaitingResponse && lastMessage?.role === "user";
 
 	return (
 		<div className="flex flex-1 flex-col bg-white">
@@ -121,6 +123,14 @@ export function ChatWindow({
 							}
 						/>
 					))}
+					{awaitingResponse && !thinking && lastMessage?.role === "user" && (
+						<div className="flex items-center gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 mt-2">
+							<Loader2 className="h-4 w-4 flex-shrink-0 animate-spin text-blue-500" />
+							<span className="text-sm text-blue-700">
+								Generating response in the background…
+							</span>
+						</div>
+					)}
 					{needsRetry && (
 						<div className="flex items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 mt-2">
 							<AlertCircle className="h-4 w-4 flex-shrink-0 text-red-500" />

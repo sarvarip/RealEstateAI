@@ -15,8 +15,13 @@ export function useMessages(conversationId: string | null) {
 	const [thinking, setThinking] = useState(false);
 	const [toolStatus, setToolStatus] = useState<string | null>(null);
 	const [proposal, setProposal] = useState<SectionsProposal | null>(null);
-	const abortRef = useRef<AbortController | null>(null);
+	const [pendingConvs, setPendingConvs] = useState<Set<string>>(new Set());
+	const pendingConvsRef = useRef(pendingConvs);
+	pendingConvsRef.current = pendingConvs;
+
 	const statusTimeoutRef = useRef<number>(0);
+	const convIdRef = useRef(conversationId);
+	convIdRef.current = conversationId;
 
 	const refresh = useCallback(async () => {
 		if (!conversationId) {
@@ -30,23 +35,24 @@ export function useMessages(conversationId: string | null) {
 			const data = await api.fetchMessages(conversationId);
 			setMessages(data);
 
-			// Restore the proposal widget only if the LAST assistant message
-			// contains proposed_sections. If Phase 2 was already executed,
-			// the last assistant message will be the report (no sections),
-			// so the widget correctly stays hidden.
-			const lastAssistant = [...data]
-				.reverse()
-				.find((m) => m.role === "assistant");
-			if (
-				lastAssistant?.proposed_sections &&
-				lastAssistant.proposed_sections.length > 0
-			) {
-				setProposal({
-					sections: lastAssistant.proposed_sections,
-					docSummary: lastAssistant.doc_summary ?? "",
-				});
-			} else {
-				setProposal(null);
+			// Don't restore the proposal widget if this conversation has a
+			// background stream running — Phase 2 already cleared it and the
+			// DB still has the Phase 1 proposal as the last assistant message.
+			if (!pendingConvsRef.current.has(conversationId)) {
+				const lastAssistant = [...data]
+					.reverse()
+					.find((m) => m.role === "assistant");
+				if (
+					lastAssistant?.proposed_sections &&
+					lastAssistant.proposed_sections.length > 0
+				) {
+					setProposal({
+						sections: lastAssistant.proposed_sections,
+						docSummary: lastAssistant.doc_summary ?? "",
+					});
+				} else {
+					setProposal(null);
+				}
 			}
 		} catch (err) {
 			setError(err instanceof Error ? err.message : "Failed to load messages");
@@ -56,20 +62,18 @@ export function useMessages(conversationId: string | null) {
 	}, [conversationId]);
 
 	useEffect(() => {
+		setThinking(false);
+		setToolStatus(null);
+		setError(null);
+		clearTimeout(statusTimeoutRef.current);
 		refresh();
-		return () => {
-			if (abortRef.current) {
-				abortRef.current.abort();
-			}
-		};
 	}, [refresh]);
 
 	const processStream = useCallback(
-		async (
-			response: Response,
-			opts?: { isReportExecution?: boolean },
-		) => {
-			if (!response.body || !conversationId) return;
+		async (response: Response, ownerConvId: string, isReportExecution: boolean) => {
+			if (!response.body) return;
+
+			const isCurrent = () => convIdRef.current === ownerConvId;
 
 			const reader = response.body.getReader();
 			const decoder = new TextDecoder();
@@ -78,132 +82,158 @@ export function useMessages(conversationId: string | null) {
 			let pendingCitations: Citation[] = [];
 			let gotResponse = false;
 
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
+			try {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
 
-				buffer += decoder.decode(value, { stream: true });
-				const lines = buffer.split("\n");
-				buffer = lines.pop() ?? "";
+					buffer += decoder.decode(value, { stream: true });
+					const lines = buffer.split("\n");
+					buffer = lines.pop() ?? "";
 
-				for (const line of lines) {
-					const trimmed = line.trim();
-					if (!trimmed || !trimmed.startsWith("data: ")) continue;
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed || !trimmed.startsWith("data: ")) continue;
 
-					const data = trimmed.slice(6);
-					if (data === "[DONE]") continue;
+						const data = trimmed.slice(6);
+						if (data === "[DONE]") continue;
 
-					try {
-						const parsed = JSON.parse(data) as Record<string, unknown>;
+						try {
+							const parsed = JSON.parse(data) as Record<string, unknown>;
 
-						if (parsed.type === "status") {
-							const s = parsed.status as string;
-							const phase = parsed.phase as
-								| string
-								| undefined;
-							const section = parsed.section as
-								| string
-								| undefined;
+							if (!isCurrent()) continue;
 
-							const phaseLabel =
-								phase === "summary"
-									? "Analysing"
-									: phase === "planning"
-										? "Planning"
-										: section
-											? section
-											: null;
-							const prefix = phaseLabel
-								? `${phaseLabel}: `
-								: "";
+							if (parsed.type === "status") {
+								const s = parsed.status as string;
+								const phase = parsed.phase as string | undefined;
+								const section = parsed.section as string | undefined;
 
-							if (s === "searching") {
-								setToolStatus(
-									`${prefix}Searching: ${(parsed.query as string) ?? ""}`.trim(),
-								);
-							} else if (s === "reading") {
-								setToolStatus(
-									`${prefix}Reading page ${parsed.page} of ${(parsed.filename as string) ?? "document"}`,
-								);
-							} else if (s === "summarising") {
-								setToolStatus("Analysing documents…");
-							} else if (s === "planning") {
-								setToolStatus("Planning report sections…");
-							} else {
-								setToolStatus(null);
+								const phaseLabel =
+									phase === "summary"
+										? "Analysing"
+										: phase === "planning"
+											? "Planning"
+											: section
+												? section
+												: null;
+								const prefix = phaseLabel ? `${phaseLabel}: ` : "";
+
+								if (s === "searching") {
+									setToolStatus(
+										`${prefix}Searching: ${(parsed.query as string) ?? ""}`.trim(),
+									);
+								} else if (s === "reading") {
+									setToolStatus(
+										`${prefix}Reading page ${parsed.page} of ${(parsed.filename as string) ?? "document"}`,
+									);
+								} else if (s === "summarising") {
+									setToolStatus("Analysing documents…");
+								} else if (s === "planning") {
+									setToolStatus("Planning report sections…");
+								} else {
+									setToolStatus(null);
+								}
+								clearTimeout(statusTimeoutRef.current);
+								const timeout =
+									phase === "summary" || phase === "planning"
+										? 30000
+										: 8000;
+								statusTimeoutRef.current = window.setTimeout(() => {
+									if (isCurrent()) {
+										setToolStatus("Generating response…");
+									}
+								}, timeout);
+							} else if (parsed.type === "segments") {
+								pendingSegments = parsed.segments as AnswerSegment[];
+								pendingCitations =
+									(parsed.segments as AnswerSegment[])?.flatMap(
+										(seg: AnswerSegment) => seg.citations,
+									) ?? [];
+							} else if (parsed.type === "sections_proposal") {
+								const sections = (parsed.sections as ReportSection[]) ?? [];
+								const docSummary = (parsed.doc_summary as string) ?? "";
+								if (sections.length > 0) {
+									setProposal({ sections, docSummary });
+								}
+							} else if (parsed.type === "message" && parsed.message) {
+								gotResponse = true;
+								const msg = parsed.message as Message;
+								const fullMsg: Message = {
+									...msg,
+									citations: msg.citations ?? pendingCitations,
+									segments: msg.segments ?? pendingSegments,
+								};
+								setMessages((prev) => [...prev, fullMsg]);
+							} else if (parsed.type === "content" && parsed.content) {
+								gotResponse = true;
+								const fallbackMsg: Message = {
+									id: `err-${Date.now()}`,
+									conversation_id: ownerConvId,
+									role: "assistant",
+									content: parsed.content as string,
+									sources_cited: 0,
+									citations: [],
+									created_at: new Date().toISOString(),
+								};
+								setMessages((prev) => [...prev, fallbackMsg]);
 							}
-							clearTimeout(statusTimeoutRef.current);
-							const timeout =
-								phase === "summary" || phase === "planning"
-									? 30000
-									: 8000;
-							statusTimeoutRef.current = window.setTimeout(
-								() => {
-									setToolStatus("Generating response…");
-								},
-								timeout,
-							);
-						} else if (parsed.type === "segments") {
-							pendingSegments = parsed.segments as AnswerSegment[];
-							pendingCitations =
-								(parsed.segments as AnswerSegment[])?.flatMap(
-									(seg: AnswerSegment) => seg.citations,
-								) ?? [];
-					} else if (parsed.type === "sections_proposal") {
-						const sections =
-							(parsed.sections as ReportSection[]) ?? [];
-						const docSummary =
-							(parsed.doc_summary as string) ?? "";
-						if (sections.length > 0) {
-							setProposal({ sections, docSummary });
+						} catch {
+							// skip invalid JSON lines
 						}
-						} else if (parsed.type === "message" && parsed.message) {
-							gotResponse = true;
-							const msg = parsed.message as Message;
-							const fullMsg: Message = {
-								...msg,
-								citations: msg.citations ?? pendingCitations,
-								segments: msg.segments ?? pendingSegments,
-							};
-							setMessages((prev) => [...prev, fullMsg]);
-						} else if (parsed.type === "content" && parsed.content) {
-							gotResponse = true;
-							const fallbackMsg: Message = {
-								id: `err-${Date.now()}`,
-								conversation_id: conversationId,
-								role: "assistant",
-								content: parsed.content as string,
-								sources_cited: 0,
-								citations: [],
-								created_at: new Date().toISOString(),
-							};
-							setMessages((prev) => [...prev, fallbackMsg]);
-						}
-					} catch {
-						// Skip invalid JSON
 					}
+				}
+			} catch {
+				// Stream error (network drop, etc). If user switched away, ignore.
+				if (!isCurrent()) return;
+			}
+
+			// Stream ended. Remove from pending set.
+			setPendingConvs((prev) => {
+				const next = new Set(prev);
+				next.delete(ownerConvId);
+				return next;
+			});
+
+			clearTimeout(statusTimeoutRef.current);
+
+			if (isCurrent()) {
+				setThinking(false);
+				setToolStatus(null);
+
+				if (!gotResponse) {
+					setError(
+						"Connection lost — the server may have restarted. Please try again.",
+					);
+				}
+
+				if (isReportExecution) {
+					setProposal(null);
 				}
 			}
 
-			if (!gotResponse) {
-				setError(
-					"Connection lost — the server may have restarted. Please try again.",
-				);
+			// Always try to refresh from DB — the backend saved the message.
+			// If user navigated back by the time this resolves, they see it.
+			try {
+				const freshMessages = await api.fetchMessages(ownerConvId);
+				if (convIdRef.current === ownerConvId) {
+					setMessages(freshMessages);
+				}
+			} catch {
+				// network error on refresh — user can manually reload
 			}
-
-			const freshMessages = await api.fetchMessages(conversationId);
-			setMessages(freshMessages);
 		},
-		[conversationId],
+		[],
 	);
 
 	const send = useCallback(
 		async (content: string) => {
 			if (!conversationId || thinking) return;
 
+			const targetConvId = conversationId;
+
 			const userMessage: Message = {
 				id: `temp-${Date.now()}`,
-				conversation_id: conversationId,
+				conversation_id: targetConvId,
 				role: "user",
 				content,
 				sources_cited: 0,
@@ -216,17 +246,21 @@ export function useMessages(conversationId: string | null) {
 			setToolStatus(null);
 			setError(null);
 			setProposal(null);
+			setPendingConvs((prev) => new Set(prev).add(targetConvId));
 
 			try {
-				const response = await api.sendMessage(conversationId, content);
-				await processStream(response);
+				const response = await api.sendMessage(targetConvId, content);
+				await processStream(response, targetConvId, false);
 			} catch (err) {
-				if (err instanceof DOMException && err.name === "AbortError") return;
+				if (convIdRef.current !== targetConvId) return;
 				setError(
 					err instanceof Error ? err.message : "Failed to send message",
 				);
-			} finally {
-				clearTimeout(statusTimeoutRef.current);
+				setPendingConvs((prev) => {
+					const next = new Set(prev);
+					next.delete(targetConvId);
+					return next;
+				});
 				setThinking(false);
 				setToolStatus(null);
 			}
@@ -243,15 +277,14 @@ export function useMessages(conversationId: string | null) {
 			);
 			if (selectedSections.length === 0) return;
 
-			// Build a descriptive message showing which sections were selected,
-			// so the conversation flow is clear (instead of repeating the original prompt)
+			const targetConvId = conversationId;
+
 			const sectionList = selectedSections.map((s) => s.title).join(", ");
 			const content = `Generate report sections: ${sectionList}`;
 
-			// Show the selected sections as a user message in the UI
 			const userMessage: Message = {
 				id: `temp-${Date.now()}`,
-				conversation_id: conversationId,
+				conversation_id: targetConvId,
 				role: "user",
 				content,
 				sources_cited: 0,
@@ -264,26 +297,34 @@ export function useMessages(conversationId: string | null) {
 			setToolStatus("Generating report sections…");
 			setError(null);
 			setProposal(null);
+			setPendingConvs((prev) => new Set(prev).add(targetConvId));
 
 			try {
-				const response = await api.sendMessage(conversationId, content, {
+				const response = await api.sendMessage(targetConvId, content, {
 					reportSections: selectedSections,
 					docSummary: proposal.docSummary,
 				});
-				await processStream(response, { isReportExecution: true });
+				await processStream(response, targetConvId, true);
 			} catch (err) {
-				if (err instanceof DOMException && err.name === "AbortError") return;
+				if (convIdRef.current !== targetConvId) return;
 				setError(
 					err instanceof Error ? err.message : "Failed to generate report",
 				);
-			} finally {
-				clearTimeout(statusTimeoutRef.current);
+				setPendingConvs((prev) => {
+					const next = new Set(prev);
+					next.delete(targetConvId);
+					return next;
+				});
 				setThinking(false);
 				setToolStatus(null);
 			}
 		},
 		[conversationId, thinking, proposal, messages, processStream],
 	);
+
+	const awaitingResponse = conversationId
+		? pendingConvs.has(conversationId)
+		: false;
 
 	return {
 		messages,
@@ -292,6 +333,7 @@ export function useMessages(conversationId: string | null) {
 		thinking,
 		toolStatus,
 		proposal,
+		awaitingResponse,
 		send,
 		executeReport,
 		refresh,

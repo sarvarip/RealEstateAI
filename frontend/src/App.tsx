@@ -26,6 +26,7 @@ export default function App() {
 		thinking,
 		toolStatus,
 		proposal,
+		awaitingResponse,
 		send,
 		executeReport,
 	} = useMessages(selectedId);
@@ -113,6 +114,7 @@ export default function App() {
 			thinking={thinking}
 			toolStatus={toolStatus}
 			proposal={proposal}
+			awaitingResponse={awaitingResponse}
 			hasDocument={documents.length > 0}
 			conversationId={selectedId}
 			onSend={handleSend}
