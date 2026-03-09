@@ -28,6 +28,8 @@ export interface Message {
 	sources_cited: number;
 	citations: Citation[];
 	segments?: AnswerSegment[];
+	proposed_sections?: ReportSection[];
+	doc_summary?: string;
 	created_at: string;
 }
 

@@ -47,6 +47,12 @@ class SegmentOut(BaseModel):
     citations: list[CitationOut]
 
 
+class ReportSectionOut(BaseModel):
+    id: str
+    title: str
+    description: str
+
+
 class MessageOut(BaseModel):
     id: str
     conversation_id: str
@@ -55,6 +61,8 @@ class MessageOut(BaseModel):
     sources_cited: int
     citations: list[CitationOut]
     segments: list[SegmentOut] | None = None
+    proposed_sections: list[ReportSectionOut] | None = None
+    doc_summary: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -75,6 +83,8 @@ def _message_to_out(m: Message) -> MessageOut:
     """Convert a DB Message to a MessageOut, handling both legacy and v2 formats."""
     citations: list[CitationOut] = []
     segments: list[SegmentOut] | None = None
+    proposed_sections: list[ReportSectionOut] | None = None
+    doc_summary: str | None = None
 
     if m.citations_json:
         try:
@@ -88,6 +98,12 @@ def _message_to_out(m: Message) -> MessageOut:
                 seg_cites = [CitationOut(**c) for c in seg_data.get("citations", [])]
                 citations.extend(seg_cites)
                 segments.append(SegmentOut(text=seg_data["text"], citations=seg_cites))
+
+            if raw.get("proposed_sections"):
+                proposed_sections = [
+                    ReportSectionOut(**s) for s in raw["proposed_sections"]
+                ]
+                doc_summary = raw.get("doc_summary")
         elif isinstance(raw, list):
             for c in raw:
                 citations.append(CitationOut(**{
@@ -103,6 +119,8 @@ def _message_to_out(m: Message) -> MessageOut:
         sources_cited=m.sources_cited,
         citations=citations,
         segments=segments,
+        proposed_sections=proposed_sections,
+        doc_summary=doc_summary,
         created_at=m.created_at,
     )
 

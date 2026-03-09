@@ -21,6 +21,7 @@ export function useMessages(conversationId: string | null) {
 	const refresh = useCallback(async () => {
 		if (!conversationId) {
 			setMessages([]);
+			setProposal(null);
 			return;
 		}
 		try {
@@ -28,6 +29,25 @@ export function useMessages(conversationId: string | null) {
 			setError(null);
 			const data = await api.fetchMessages(conversationId);
 			setMessages(data);
+
+			// Restore the proposal widget only if the LAST assistant message
+			// contains proposed_sections. If Phase 2 was already executed,
+			// the last assistant message will be the report (no sections),
+			// so the widget correctly stays hidden.
+			const lastAssistant = [...data]
+				.reverse()
+				.find((m) => m.role === "assistant");
+			if (
+				lastAssistant?.proposed_sections &&
+				lastAssistant.proposed_sections.length > 0
+			) {
+				setProposal({
+					sections: lastAssistant.proposed_sections,
+					docSummary: lastAssistant.doc_summary ?? "",
+				});
+			} else {
+				setProposal(null);
+			}
 		} catch (err) {
 			setError(err instanceof Error ? err.message : "Failed to load messages");
 		} finally {
@@ -37,7 +57,6 @@ export function useMessages(conversationId: string | null) {
 
 	useEffect(() => {
 		refresh();
-		setProposal(null);
 		return () => {
 			if (abortRef.current) {
 				abortRef.current.abort();
