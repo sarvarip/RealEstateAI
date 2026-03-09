@@ -14,8 +14,8 @@ Lawyers working on property acquisitions need to reconcile information spread ac
 
 **Tiered retrieval strategy:**
 
-- **Full-context mode** (default): When the total document text fits within the token threshold (~100K tokens), all text is sent directly to the LLM. This is the common case for small bundles (2-5 documents) and produces the best answers since the model sees everything.
-- **RAG mode**: For larger corpora (12+ documents, or very long leases), the system automatically switches to retrieval-augmented generation. Documents are chunked at paragraph boundaries (1,500 chars, 200-char overlap), embedded with Azure OpenAI `text-embedding-3-large` (3,072 dimensions), stored in pgvector, and the top-50 most relevant chunks are retrieved via cosine similarity at query time.
+- **Full-context mode** (default): When the total document text fits within the token threshold (~50K tokens), all text is sent directly to the LLM. This is the common case for small bundles (2-5 documents) and produces the best answers since the model sees everything.
+- **RAG mode**: For larger corpora, the system automatically switches to retrieval-augmented generation. Documents are chunked at paragraph boundaries (1,500 chars, 200-char overlap), embedded with Azure OpenAI `text-embedding-3-large` (3,072 dimensions), stored in pgvector, and the top-5 most relevant chunks are retrieved via cosine similarity per search call. The agent may call `search_documents()` multiple times with different queries to gather comprehensive information.
 
 The threshold is configurable and the switch is transparent — the same question API works in both modes.
 
@@ -187,8 +187,8 @@ docker compose exec backend uv run pytest backend/tests/test_real_docs.py -v
 | `TestRAGMode` | 6 | Forced RAG (threshold=1000) — same questions, verifies RAG retrieves correct chunks |
 | `TestNoAzureKeys` | 4 | Anthropic-only pipeline — OCR via vision, full-context mode, citations still work |
 | `TestSecondaryVerification` | 2 | Unit test — paraphrased quote fails primary check, secondary LLM corrects it |
-| `TestReportProposal` | 5 | Phase 1 report: summary + planning + programmatic search, section proposal |
-| `TestReportExecution` | 3 | Phase 2 report: select 2 sections, parallel agent generation, citations |
+| `TestReportProposal` | 5 | Phase 1 report: summary + planning + programmatic search (forced RAG, threshold=1000) |
+| `TestReportExecution` | 3 | Phase 2 report: select 2 sections, parallel agent generation, citations (forced RAG) |
 
 Tests use per-question response caching to avoid redundant LLM calls within a test module, and retry logic for transient API errors.
 

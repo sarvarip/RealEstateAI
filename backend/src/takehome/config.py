@@ -17,7 +17,6 @@ class Settings(BaseSettings):
     upload_dir: str = "uploads"
     max_upload_size: int = 25 * 1024 * 1024  # 25MB
     rag_token_threshold: int = 50_000
-    rag_top_k: int = 50
 
     model_config = {"env_file": ".env"}
 
