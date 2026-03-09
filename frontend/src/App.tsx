@@ -101,6 +101,9 @@ export default function App() {
 					onSelect={select}
 					onCreate={handleCreate}
 					onDelete={remove}
+					documents={documents}
+					activeDocId={activeDocId}
+					onSelectDocument={setActiveDocId}
 				/>
 
 		<ChatWindow
@@ -120,9 +123,6 @@ export default function App() {
 
 				<DocumentViewer
 					document={document}
-					documents={documents}
-					activeDocId={activeDocId}
-					onSelectDocument={setActiveDocId}
 					targetPage={targetPage}
 					highlightText={highlightText}
 					onClearHighlight={handleClearHighlight}

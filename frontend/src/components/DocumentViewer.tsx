@@ -38,9 +38,6 @@ function normalizeForMatch(text: string): string {
 
 interface DocumentViewerProps {
 	document: Document | null;
-	documents: Document[];
-	activeDocId: string | null;
-	onSelectDocument: (id: string) => void;
 	targetPage: number | null;
 	highlightText: string | null;
 	onClearHighlight?: () => void;
@@ -48,9 +45,6 @@ interface DocumentViewerProps {
 
 export function DocumentViewer({
 	document,
-	documents,
-	activeDocId,
-	onSelectDocument,
 	targetPage,
 	highlightText,
 	onClearHighlight,
@@ -63,6 +57,16 @@ export function DocumentViewer({
 	const [width, setWidth] = useState(responsiveDefaults.initial);
 	const [dragging, setDragging] = useState(false);
 	const containerRef = useRef<HTMLDivElement>(null);
+	const scrollTimerRef = useRef<ReturnType<typeof setTimeout>>();
+	// Tracks which page the text layer has been rendered for. Prevents
+	// applyHighlight from running against a stale text layer during page
+	// transitions, which caused the "jump to wrong section" bug.
+	const textLayerPageRef = useRef<number | null>(null);
+	// Monotonically increasing counter — each applyHighlight call captures
+	// the current value and checks it before scrolling. Stale calls (whose
+	// captured version != current) skip the scroll, preventing races between
+	// competing scrollIntoView animations.
+	const highlightVersionRef = useRef(0);
 
 	useEffect(() => {
 		if (targetPage !== null && targetPage >= 1 && targetPage <= numPages) {
@@ -70,7 +74,7 @@ export function DocumentViewer({
 		}
 	}, [targetPage, numPages]);
 
-	const applyHighlightToTextLayer = useCallback(() => {
+	const applyHighlightCore = useCallback(() => {
 		if (!containerRef.current) return;
 
 		const textLayer = containerRef.current.querySelector(".textLayer");
@@ -84,13 +88,27 @@ export function DocumentViewer({
 
 		if (!highlightText) return;
 
-		const spans = Array.from(
+		const rawSpans = Array.from(
 			textLayer.querySelectorAll('span[role="presentation"]'),
 		) as HTMLElement[];
-		if (spans.length === 0) return;
+		if (rawSpans.length === 0) return;
 
-		const texts = spans.map((s) => s.textContent || "");
-		const norms = texts.map(normalizeForMatch);
+		const positioned = rawSpans.map((span) => {
+			const rect = span.getBoundingClientRect();
+			return { span, top: rect.top, left: rect.left, height: rect.height };
+		});
+		const avgHeight =
+			positioned.reduce((s, p) => s + p.height, 0) / positioned.length || 10;
+		const lineTolerance = avgHeight * 0.4;
+		positioned.sort((a, b) => {
+			if (Math.abs(a.top - b.top) < lineTolerance) return a.left - b.left;
+			return a.top - b.top;
+		});
+
+		const spans = positioned.map((p) => p.span);
+		const norms = spans.map((s) =>
+			normalizeForMatch(s.textContent || ""),
+		);
 
 		const stripWs = (s: string) => s.replace(/\s+/g, "");
 
@@ -111,23 +129,46 @@ export function DocumentViewer({
 		if (matchIdx === -1) return;
 
 		const matchEnd = matchIdx + quoteStripped.length;
+		let firstHighlighted: HTMLElement | null = null;
 		for (let i = 0; i < spanRanges.length; i++) {
 			if (spanRanges[i].end > matchIdx && spanRanges[i].start < matchEnd) {
 				spans[i].style.backgroundColor = "rgba(254, 240, 138, 0.6)";
 				spans[i].style.borderRadius = "2px";
 				spans[i].classList.add("citation-highlight");
+				if (!firstHighlighted) firstHighlighted = spans[i];
 			}
 		}
 
-		const first = textLayer.querySelector(".citation-highlight");
-		if (first) {
-			first.scrollIntoView({ block: "center", behavior: "smooth" });
+		if (firstHighlighted) {
+			const target = firstHighlighted;
+			const version = ++highlightVersionRef.current;
+			clearTimeout(scrollTimerRef.current);
+			scrollTimerRef.current = setTimeout(() => {
+				if (highlightVersionRef.current !== version) return;
+				target.scrollIntoView({ block: "center", behavior: "instant" });
+			}, 250);
 		}
 	}, [highlightText]);
 
+	const applyHighlightRef = useRef(applyHighlightCore);
+	applyHighlightRef.current = applyHighlightCore;
+
+	// Called by react-pdf when the text layer finishes rendering.
+	// Stable callback (empty deps) so react-pdf doesn't re-render.
+	const onTextLayerReady = useCallback(() => {
+		textLayerPageRef.current = currentPage;
+		applyHighlightRef.current();
+	}, [currentPage]);
+
+	// When highlightText changes on the SAME page, onTextLayerReady won't
+	// fire (no re-render), so this effect handles that case. The guard
+	// ensures we never run against a stale text layer during page transitions.
 	useEffect(() => {
-		applyHighlightToTextLayer();
-	}, [applyHighlightToTextLayer]);
+		if (textLayerPageRef.current === currentPage) {
+			applyHighlightCore();
+		}
+		return () => clearTimeout(scrollTimerRef.current);
+	}, [applyHighlightCore, currentPage]);
 
 	const handleMouseDown = useCallback(
 		(e: React.MouseEvent) => {
@@ -158,19 +199,21 @@ export function DocumentViewer({
 		[width],
 	);
 
-	const handleDocSwitch = useCallback(
-		(docId: string) => {
-			onSelectDocument(docId);
+	// Reset page state when the active document changes (driven by sidebar)
+	const prevDocId = useRef(document?.id);
+	useEffect(() => {
+		if (document?.id !== prevDocId.current) {
+			prevDocId.current = document?.id;
 			setCurrentPage(1);
 			setPdfLoading(true);
 			setPdfError(null);
-		},
-		[onSelectDocument],
-	);
+			textLayerPageRef.current = null;
+		}
+	}, [document?.id]);
 
 	const pdfPageWidth = width - 48;
 
-	if (documents.length === 0) {
+	if (!document) {
 		return (
 			<div
 				style={{ width }}
@@ -198,29 +241,6 @@ export function DocumentViewer({
 				onMouseDown={handleMouseDown}
 			/>
 
-			{/* Document tabs */}
-			{documents.length > 1 && (
-				<div className="flex gap-0 overflow-x-auto border-b border-neutral-100">
-					{documents.map((doc) => (
-						<button
-							key={doc.id}
-							type="button"
-							onClick={() => handleDocSwitch(doc.id)}
-							className={`flex-shrink-0 border-b-2 px-3 py-2 text-xs transition-colors ${
-								doc.id === activeDocId
-									? "border-neutral-800 bg-white text-neutral-800 font-medium"
-									: "border-transparent text-neutral-400 hover:text-neutral-600 hover:bg-neutral-50"
-							}`}
-							title={doc.filename}
-						>
-							<span className="block max-w-[120px] truncate">
-								{doc.filename.replace(".pdf", "")}
-							</span>
-						</button>
-					))}
-				</div>
-			)}
-
 			{/* Header */}
 			<div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
 				<div className="min-w-0">
@@ -229,12 +249,6 @@ export function DocumentViewer({
 					</p>
 					<p className="text-xs text-neutral-400">
 						{document?.page_count} page{document?.page_count !== 1 ? "s" : ""}
-						{documents.length > 1 && (
-							<span>
-								{" "}
-								· {documents.length} documents in bundle
-							</span>
-						)}
 					</p>
 				</div>
 			</div>
@@ -288,7 +302,7 @@ export function DocumentViewer({
 							key={`${document?.id}-${currentPage}`}
 							pageNumber={currentPage}
 							width={pdfPageWidth}
-							onRenderTextLayerSuccess={applyHighlightToTextLayer}
+							onRenderTextLayerSuccess={onTextLayerReady}
 							loading={
 								<div className="flex items-center justify-center py-12">
 									<Loader2 className="h-5 w-5 animate-spin text-neutral-300" />

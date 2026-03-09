@@ -786,3 +786,46 @@ class TestReportExecution:
         assert any(
             t in lower for t in ["bishopsgate", "100 bishopsgate", "850,000", "850000", "£850", "meridian"]
         ), f"Expected at least one key fact in report:\n{msg['content'][:500]}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Report modification — user asks to add/change sections after proposal
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestReportModification:
+    """Verify that the modify_plan tool correctly adjusts an existing proposal.
+
+    Gets the initial proposal (cached), then sends a follow-up asking to
+    add a section on indemnity provisions. The agent should call modify_plan,
+    which re-runs the planning agent and returns a new sections_proposal.
+    """
+
+    def test_modify_plan_adds_section(self, synthetic_conversation: str) -> None:
+        _, proposal_events = _get_proposal(synthetic_conversation)
+        proposal = next(e for e in proposal_events if e["type"] == "sections_proposal")
+        initial_sections = proposal["sections"]
+        initial_titles = {s["title"].lower() for s in initial_sections}
+
+        _, modify_events = _ask_question_with_events(
+            synthetic_conversation,
+            "Please add a section about indemnity provisions to the report plan",
+            rag_threshold=1000,
+            timeout=180,
+        )
+        new_proposal = next(
+            (e for e in modify_events if e["type"] == "sections_proposal"), None
+        )
+        assert new_proposal is not None, (
+            f"No sections_proposal event after modify request. "
+            f"Events: {[e.get('type') for e in modify_events]}"
+        )
+        new_titles = {s["title"].lower() for s in new_proposal["sections"]}
+
+        assert len(new_titles) >= len(initial_titles), (
+            f"Expected at least as many sections after adding one. "
+            f"Before: {len(initial_titles)}, after: {len(new_titles)}"
+        )
+        assert any("indemnity" in t for t in new_titles), (
+            f"Expected an 'indemnity' section in new plan. Got: {new_titles}"
+        )

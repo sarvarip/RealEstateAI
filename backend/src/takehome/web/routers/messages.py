@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
 
 from takehome.db.models import Message
-from takehome.db.session import get_session
+from takehome.db.session import async_session as _session_factory, get_session
 from takehome.services.conversation import get_conversation, update_conversation
 from takehome.services.document import get_documents_for_conversation
 from takehome.services.llm import (
@@ -141,41 +141,48 @@ async def send_message(
     conversation_id: str,
     body: MessageCreate,
     rag_threshold: int | None = Query(None, description="Override RAG token threshold (for testing)"),
-    session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
-    """Send a user message and return the AI response via SSE."""
-    conversation = await get_conversation(session, conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    """Send a user message and return the AI response via SSE.
 
-    user_message = Message(
-        conversation_id=conversation_id,
-        role="user",
-        content=body.content,
-    )
-    session.add(user_message)
-    await session.commit()
-    await session.refresh(user_message)
+    Uses short-lived DB sessions: one for initial save/load, then the factory
+    is passed to agent tools so connections aren't held during LLM calls.
+    """
+    # --- Short-lived session: save user message, load docs & history ---
+    async with _session_factory() as session:
+        conversation = await get_conversation(session, conversation_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
 
-    logger.info("User message saved", conversation_id=conversation_id, message_id=user_message.id)
+        user_message = Message(
+            conversation_id=conversation_id,
+            role="user",
+            content=body.content,
+        )
+        session.add(user_message)
+        await session.commit()
+        await session.refresh(user_message)
 
-    documents = await get_documents_for_conversation(session, conversation_id)
+        logger.info("User message saved", conversation_id=conversation_id, message_id=user_message.id)
 
-    stmt = (
-        select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .where(Message.id != user_message.id)
-        .order_by(Message.created_at.asc())
-    )
-    result = await session.execute(stmt)
-    history_messages = list(result.scalars().all())
+        documents = await get_documents_for_conversation(session, conversation_id)
 
-    conversation_history: list[dict[str, str]] = [
-        {"role": m.role, "content": m.content} for m in history_messages
-    ]
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.id != user_message.id)
+            .order_by(Message.created_at.asc())
+        )
+        result = await session.execute(stmt)
+        history_messages = list(result.scalars().all())
 
-    user_msg_count = sum(1 for m in history_messages if m.role == "user")
-    is_first_message = user_msg_count == 0
+        conversation_history: list[dict[str, str]] = [
+            {"role": m.role, "content": m.content} for m in history_messages
+        ]
+
+        user_msg_count = sum(1 for m in history_messages if m.role == "user")
+        is_first_message = user_msg_count == 0
+
+    # Session closed — DB connection returned to pool before LLM calls begin
 
     is_report_execution = bool(body.report_sections)
 
@@ -195,7 +202,7 @@ async def send_message(
                     return await execute_report_sections(
                         sections=body.report_sections or [],
                         doc_summary=body.doc_summary or "",
-                        session=session,
+                        session_factory=_session_factory,
                         conversation_id=conversation_id,
                         documents=documents,
                         on_tool_call=on_tool_call,
@@ -203,7 +210,7 @@ async def send_message(
                 else:
                     return await answer_with_citations(
                         user_message=body.content,
-                        session=session,
+                        session_factory=_session_factory,
                         conversation_id=conversation_id,
                         conversation_history=conversation_history,
                         documents=documents,
@@ -234,16 +241,19 @@ async def send_message(
 
         sources = len(structured.citations)
 
-        citations_json = json.dumps({
+        citations_data: dict[str, object] = {
             "version": 2,
             "segments": structured.segments,
-        })
+        }
+        if structured.doc_summary:
+            citations_data["doc_summary"] = structured.doc_summary
+        if structured.proposed_sections:
+            citations_data["proposed_sections"] = structured.proposed_sections
+        citations_json = json.dumps(citations_data)
 
         yield _sse({"type": "segments", "segments": structured.segments})
 
-        from takehome.db.session import async_session as session_factory
-
-        async with session_factory() as save_session:
+        async with _session_factory() as save_session:
             assistant_message = Message(
                 conversation_id=conversation_id,
                 role="assistant",

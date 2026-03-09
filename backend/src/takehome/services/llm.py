@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
@@ -17,13 +18,14 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_graph.nodes import End
+from sqlalchemy import select
 from sqlalchemy import text as sa_text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from takehome.config import settings  # noqa: F401 — triggers ANTHROPIC_API_KEY export
-from takehome.db.models import Document
+from takehome.db.models import Document, Message
 from takehome.services.chunking import estimate_tokens
-from takehome.services.embedding import embed_query
+from takehome.services.embedding import async_embed_query
 
 logger = structlog.get_logger()
 
@@ -113,9 +115,12 @@ class AgentDeps:
 
     Shared across all tools within a single agent run. Mutable fields
     (doc_summary, phase, report_result) are set by tools during execution.
+
+    Uses session_factory instead of a long-lived session so that DB connections
+    are held only for the duration of each query, not the entire LLM run.
     """
 
-    session: AsyncSession
+    session_factory: async_sessionmaker[AsyncSession]
     conversation_id: str
     documents: list[Document]
     user_message: str = ""
@@ -135,7 +140,9 @@ _SYSTEM_PROMPT = (
     "TOOL ROUTING:\n"
     "- If the user asks for a report, writeup, analysis, summary document, or any "
     "comprehensive structured output, call generate_comprehensive_report() and "
-    "return its result. Do NOT call search_documents() first.\n\n"
+    "return its result. Do NOT call search_documents() first.\n"
+    "- If the user asks to add, remove, or change sections in an existing report plan, "
+    "call modify_plan() with their request. Do NOT call generate_comprehensive_report().\n\n"
     "ANSWER FORMAT:\n"
     "- Answer questions based ONLY on the document content provided or retrieved.\n"
     "- Break your answer into logical segments. Each segment should be one or two "
@@ -191,7 +198,7 @@ async def search_documents(ctx: RunContext[AgentDeps], query: str) -> str:
         return "Embeddings are not available. Use the full document text provided above."
 
     try:
-        query_embedding = embed_query(query)
+        query_embedding = await async_embed_query(query)
     except RuntimeError:
         return "Embeddings are not available. Use the full document text provided above."
 
@@ -208,15 +215,16 @@ async def search_documents(ctx: RunContext[AgentDeps], query: str) -> str:
         LIMIT :top_k
     """)
 
-    result = await ctx.deps.session.execute(
-        stmt,
-        {
-            "query_embedding": str(query_embedding),
-            "conversation_id": ctx.deps.conversation_id,
-            "top_k": SEARCH_TOP_K,
-        },
-    )
-    rows = result.fetchall()
+    async with ctx.deps.session_factory() as session:
+        result = await session.execute(
+            stmt,
+            {
+                "query_embedding": str(query_embedding),
+                "conversation_id": ctx.deps.conversation_id,
+                "top_k": SEARCH_TOP_K,
+            },
+        )
+        rows = result.fetchall()
 
     if not rows:
         return "No matching content found. Try a different query."
@@ -318,7 +326,7 @@ async def _generate_doc_summaries(deps: AgentDeps) -> str:
         await deps.on_tool_call("summarising", {"doc_count": len(deps.documents)})
 
     summary_deps = AgentDeps(
-        session=deps.session,
+        session_factory=deps.session_factory,
         conversation_id=deps.conversation_id,
         documents=deps.documents,
         on_tool_call=deps.on_tool_call,
@@ -416,7 +424,7 @@ async def generate_comprehensive_report(ctx: RunContext[AgentDeps], report_type:
 
     proposal = await _search_and_build_proposal(
         plan=plan,
-        session=ctx.deps.session,
+        session_factory=ctx.deps.session_factory,
         conversation_id=ctx.deps.conversation_id,
         documents=ctx.deps.documents,
         on_tool_call=ctx.deps.on_tool_call,
@@ -430,9 +438,98 @@ async def generate_comprehensive_report(ctx: RunContext[AgentDeps], report_type:
     return "Report proposal generated and returned to the user."
 
 
+@agentic_agent.tool
+async def modify_plan(ctx: RunContext[AgentDeps], user_request: str) -> str:
+    """Modify an existing report proposal based on user feedback.
+
+    Call this when the user asks to add, remove, or change sections
+    in a previously generated report plan. Do NOT call
+    generate_comprehensive_report — this tool reuses the existing
+    document summary and re-runs only the planning step.
+
+    Args:
+        user_request: What the user wants changed (e.g. "add a section about break clauses").
+    """
+    if ctx.deps.on_tool_call:
+        await ctx.deps.on_tool_call("planning", {"phase": "modifying plan"})
+
+    # --- Load the most recent proposal from the DB ---
+    async with ctx.deps.session_factory() as session:
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == ctx.deps.conversation_id)
+            .where(Message.role == "assistant")
+            .order_by(Message.created_at.desc())
+        )
+        result = await session.execute(stmt)
+        recent_messages = list(result.scalars().all())
+
+    doc_summary: str | None = None
+    existing_sections: list[dict[str, str]] = []
+
+    for msg in recent_messages:
+        if not msg.citations_json:
+            continue
+        try:
+            raw = json.loads(msg.citations_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(raw, dict) or raw.get("version") != 2:
+            continue
+        if raw.get("proposed_sections") and raw.get("doc_summary"):
+            doc_summary = raw["doc_summary"]
+            existing_sections = raw["proposed_sections"]
+            break
+
+    if not doc_summary or not existing_sections:
+        return (
+            "No existing report proposal found in this conversation. "
+            "Call generate_comprehensive_report() first to create an initial proposal."
+        )
+
+    # --- Re-run planning agent with existing context + user modification request ---
+    existing_titles = "\n".join(
+        f"  - {s['title']}: {s.get('description', '')}" for s in existing_sections
+    )
+
+    planning_prompt = (
+        f"You are modifying an existing report plan.\n\n"
+        f"CURRENT SECTIONS:\n{existing_titles}\n\n"
+        f"DOCUMENT SUMMARY:\n{doc_summary}\n\n"
+        f"USER REQUEST:\n{user_request}\n\n"
+        "Produce a new SectionPlan incorporating the user's changes. "
+        "Keep existing sections unless the user explicitly asks to remove them."
+    )
+
+    plan_result = await _planning_agent.run(planning_prompt)
+    plan: SectionPlan = plan_result.output
+
+    logger.info(
+        "Modified plan generated",
+        section_count=len(plan.sections),
+        sections=[s.title for s in plan.sections],
+    )
+
+    # --- Re-run programmatic search with the updated plan ---
+    ctx.deps.phase = "planning"
+    proposal = await _search_and_build_proposal(
+        plan=plan,
+        session_factory=ctx.deps.session_factory,
+        conversation_id=ctx.deps.conversation_id,
+        documents=ctx.deps.documents,
+        on_tool_call=ctx.deps.on_tool_call,
+        doc_summary=doc_summary,
+    )
+
+    # Same termination mechanism as generate_comprehensive_report
+    ctx.deps.report_result = proposal
+    logger.info("Plan modification completed", sections=len(plan.sections))
+    return "Modified report proposal generated and returned to the user."
+
+
 async def _search_and_build_proposal(
     plan: SectionPlan,
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     conversation_id: str,
     documents: list[Document],
     on_tool_call: ToolCallbackT | None,
@@ -462,7 +559,7 @@ async def _search_and_build_proposal(
             await on_tool_call("searching", {"query": sec.search_query, "phase": "planning"})
 
         try:
-            query_embedding = embed_query(sec.search_query)
+            query_embedding = await async_embed_query(sec.search_query)
         except RuntimeError:
             segments.append({
                 "text": f"**{i+1}. {sec.title}** — Could not search (embeddings unavailable)",
@@ -483,15 +580,16 @@ async def _search_and_build_proposal(
             LIMIT 1
         """)
 
-        result = await session.execute(
-            stmt,
-            {
-                "query_embedding": str(query_embedding),
-                "conversation_id": conversation_id,
-                "top_k": 1,
-            },
-        )
-        row = result.fetchone()
+        async with session_factory() as session:
+            result = await session.execute(
+                stmt,
+                {
+                    "query_embedding": str(query_embedding),
+                    "conversation_id": conversation_id,
+                    "top_k": 1,
+                },
+            )
+            row = result.fetchone()
 
         # Build a URL-safe section ID from the title for frontend tracking
         section_id = re.sub(r"[^a-z0-9]+", "_", sec.title.lower()).strip("_")
@@ -645,7 +743,7 @@ def _build_full_text(documents: list[Document]) -> str:
 
 async def answer_with_citations(
     user_message: str,
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     conversation_id: str,
     conversation_history: list[dict[str, str]],
     documents: list[Document],
@@ -660,7 +758,7 @@ async def answer_with_citations(
     search_documents() and get_page() to retrieve what it needs.
     """
     deps = AgentDeps(
-        session=session,
+        session_factory=session_factory,
         conversation_id=conversation_id,
         documents=documents,
         user_message=user_message,
@@ -853,7 +951,7 @@ async def _run_section_agent(
 async def execute_report_sections(
     sections: list[dict[str, str]],
     doc_summary: str,
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     conversation_id: str,
     documents: list[Document],
     on_tool_call: ToolCallbackT | None = None,
@@ -885,7 +983,7 @@ async def execute_report_sections(
             section_callback = _prefixed_callback
 
         section_deps = AgentDeps(
-            session=session,
+            session_factory=session_factory,
             conversation_id=conversation_id,
             documents=documents,
             on_tool_call=section_callback,
