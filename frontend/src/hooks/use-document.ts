@@ -32,15 +32,19 @@ export function useDocument(conversationId: string | null) {
 	}, [refresh]);
 
 	const upload = useCallback(
-		async (file: File) => {
-			if (!conversationId) return null;
+		async (files: File[]) => {
+			if (!conversationId || files.length === 0) return null;
 			try {
 				setUploading(true);
 				setError(null);
-				const doc = await api.uploadDocument(conversationId, file);
-				setDocuments((prev) => [...prev, doc]);
-				setActiveDocId(doc.id);
-				return doc;
+				let lastDoc: Document | null = null;
+				for (const file of files) {
+					const doc = await api.uploadDocument(conversationId, file);
+					setDocuments((prev) => [...prev, doc]);
+					lastDoc = doc;
+				}
+				if (lastDoc) setActiveDocId(lastDoc.id);
+				return lastDoc;
 			} catch (err) {
 				setError(
 					err instanceof Error ? err.message : "Failed to upload document",

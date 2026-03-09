@@ -16,7 +16,7 @@ interface ChatWindowProps {
 	hasDocument: boolean;
 	conversationId: string | null;
 	onSend: (content: string) => void;
-	onUpload: (file: File) => void;
+	onUpload: (files: File[]) => void;
 	onCitationClick?: (citation: Citation) => void;
 	onExecuteReport?: (sectionIds: string[]) => void;
 }
