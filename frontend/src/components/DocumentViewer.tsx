@@ -57,22 +57,58 @@ export function DocumentViewer({
 	const [width, setWidth] = useState(responsiveDefaults.initial);
 	const [dragging, setDragging] = useState(false);
 	const containerRef = useRef<HTMLDivElement>(null);
-	const scrollTimerRef = useRef<ReturnType<typeof setTimeout>>();
-	// Tracks which page the text layer has been rendered for. Prevents
-	// applyHighlight from running against a stale text layer during page
-	// transitions, which caused the "jump to wrong section" bug.
+	const scrollContainerRef = useRef<HTMLDivElement>(null);
+	const scrollEnforcerRef = useRef<ReturnType<typeof setTimeout>>();
 	const textLayerPageRef = useRef<number | null>(null);
-	// Monotonically increasing counter — each applyHighlight call captures
-	// the current value and checks it before scrolling. Stale calls (whose
-	// captured version != current) skip the scroll, preventing races between
-	// competing scrollIntoView animations.
-	const highlightVersionRef = useRef(0);
+	const currentPageRef = useRef(currentPage);
+	currentPageRef.current = currentPage;
 
 	useEffect(() => {
 		if (targetPage !== null && targetPage >= 1 && targetPage <= numPages) {
 			setCurrentPage(targetPage);
 		}
 	}, [targetPage, numPages]);
+
+	/**
+	 * Scrolls the PDF scroll container so that `target` is vertically centred.
+	 *
+	 * Uses direct scrollTop manipulation instead of scrollIntoView because
+	 * react-pdf's multi-layer rendering (canvas → text → annotation) causes
+	 * layout shifts that the browser's scroll restoration fights against,
+	 * producing the "jump to wrong section" bug.
+	 *
+	 * The enforcer re-applies the scroll position across several animation
+	 * frames so that any late layout shifts (e.g. annotation layer) get
+	 * overridden rather than displacing our scroll target.
+	 */
+	const scrollToElement = useCallback((target: HTMLElement) => {
+		const scroller = scrollContainerRef.current;
+		if (!scroller) return;
+
+		// Cancel any previous enforcer
+		clearTimeout(scrollEnforcerRef.current);
+
+		const computeDesiredTop = () => {
+			const scrollerRect = scroller.getBoundingClientRect();
+			const targetRect = target.getBoundingClientRect();
+			const offsetInScroller =
+				targetRect.top - scrollerRect.top + scroller.scrollTop;
+			return offsetInScroller - scroller.clientHeight / 2 + targetRect.height / 2;
+		};
+
+		// Apply immediately
+		scroller.scrollTop = computeDesiredTop();
+
+		// Re-apply across several frames to defeat layout shifts from
+		// react-pdf's annotation layer and canvas re-renders.
+		let framesLeft = 6;
+		const enforce = () => {
+			if (framesLeft-- <= 0) return;
+			scroller.scrollTop = computeDesiredTop();
+			scrollEnforcerRef.current = setTimeout(enforce, 80);
+		};
+		scrollEnforcerRef.current = setTimeout(enforce, 80);
+	}, []);
 
 	const applyHighlightCore = useCallback(() => {
 		if (!containerRef.current) return;
@@ -140,34 +176,27 @@ export function DocumentViewer({
 		}
 
 		if (firstHighlighted) {
-			const target = firstHighlighted;
-			const version = ++highlightVersionRef.current;
-			clearTimeout(scrollTimerRef.current);
-			scrollTimerRef.current = setTimeout(() => {
-				if (highlightVersionRef.current !== version) return;
-				target.scrollIntoView({ block: "center", behavior: "instant" });
-			}, 250);
+			scrollToElement(firstHighlighted);
 		}
-	}, [highlightText]);
+	}, [highlightText, scrollToElement]);
 
 	const applyHighlightRef = useRef(applyHighlightCore);
 	applyHighlightRef.current = applyHighlightCore;
 
-	// Called by react-pdf when the text layer finishes rendering.
-	// Stable callback (empty deps) so react-pdf doesn't re-render.
+	// Stable callback — no deps that change per-page so react-pdf never
+	// gets a new prop and never re-renders the text layer spuriously.
 	const onTextLayerReady = useCallback(() => {
-		textLayerPageRef.current = currentPage;
+		textLayerPageRef.current = currentPageRef.current;
 		applyHighlightRef.current();
-	}, [currentPage]);
+	}, []);
 
 	// When highlightText changes on the SAME page, onTextLayerReady won't
-	// fire (no re-render), so this effect handles that case. The guard
-	// ensures we never run against a stale text layer during page transitions.
+	// fire (no re-render), so this effect handles that case.
 	useEffect(() => {
 		if (textLayerPageRef.current === currentPage) {
 			applyHighlightCore();
 		}
-		return () => clearTimeout(scrollTimerRef.current);
+		return () => clearTimeout(scrollEnforcerRef.current);
 	}, [applyHighlightCore, currentPage]);
 
 	const handleMouseDown = useCallback(
@@ -271,7 +300,7 @@ export function DocumentViewer({
 			)}
 
 			{/* PDF content */}
-			<div className="flex-1 overflow-y-auto p-4">
+			<div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4">
 				{pdfError && (
 					<div className="rounded-lg bg-red-50 p-3 text-sm text-red-600">
 						{pdfError}
